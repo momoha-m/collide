@@ -1,0 +1,16 @@
+.DS_Store
+
+# Build products and generated files
+bin/
+build/
+obj/
+
+# Local backups / temporary snapshots
+backups/
+
+# Xcode user-local state
+*.xcuserstate
+xcuserdata/
+
+# Logs
+*.log
