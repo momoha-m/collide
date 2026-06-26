@@ -48,6 +48,23 @@ private:
 		glm::vec3 velocity = glm::vec3(0.0f);
 	};
 
+	struct GalaxyFieldLocal {
+		glm::vec3 flowVelocity = glm::vec3(0.0f);
+		glm::mat3 gradU = glm::mat3(0.0f);
+		glm::vec3 vorticity = glm::vec3(0.0f);
+		glm::vec3 flowForce = glm::vec3(0.0f);
+		glm::vec3 tidalForce = glm::vec3(0.0f);
+		glm::vec3 totalForce = glm::vec3(0.0f);
+		float density = 0.0f;
+		float dispersion = 0.0f;
+		float divergence = 0.0f;
+		float compression = 0.0f;
+		float shear = 0.0f;
+		float slip = 0.0f;
+		float vorticityMag = 0.0f;
+		bool valid = false;
+	};
+
 	struct PrefetchedFrameData {
 		std::size_t frameIndex = std::numeric_limits<std::size_t>::max();
 		std::vector<RenderParticle> particles;
@@ -122,9 +139,15 @@ private:
 	std::vector<glm::vec3> compressPtsmAttractors(const std::vector<glm::vec3>& points, int maxAttractors) const;
 	bool buildPtsmFlowFrame(std::size_t frameIndex, std::vector<PtsmFlowSample>& samples) const;
 	std::vector<PtsmFlowSample> compressPtsmFlowSamples(const std::vector<PtsmFlowSample>& samples, int maxSamples) const;
-	glm::vec3 samplePtsmFlowVelocity(const glm::vec3& position) const;
-	glm::vec3 samplePtsmFlowVelocityFromFrame(const std::vector<PtsmFlowSample>& samples, const glm::vec3& position) const;
+	GalaxyFieldLocal sampleGalaxyField(const glm::vec3& position, const glm::vec3& probeVelocity) const;
+	GalaxyFieldLocal sampleGalaxyFieldFromFrame(
+		const std::vector<PtsmFlowSample>& samples,
+		const glm::vec3& position,
+		const glm::vec3& probeVelocity
+	) const;
 	void applyPtsmFlowForces(float dt);
+	glm::mat3 outerProduct(const glm::vec3& a, const glm::vec3& b) const;
+	float frobeniusNorm(const glm::mat3& matrix) const;
 	glm::vec3 randomUnitVector() const;
 	void samplePtsmAuditionSpawn(glm::vec3& position, glm::vec3& velocity) const;
 	void choosePtsmSpawn(glm::vec3& position, glm::vec3& velocity);
@@ -211,6 +234,7 @@ private:
 	ofParameter<float> ptsmFlowRadiusParam;
 	ofParameter<float> ptsmFlowVelocityScaleParam;
 	ofParameter<float> ptsmFlowVerticalMixParam;
+	ofParameter<float> ptsmTidalGainParam;
 
 	ptsm::Settings ptsmSettings;
 	ptsm::GuiBindings ptsmGui;
@@ -225,6 +249,7 @@ private:
 	ofSpherePrimitive ptsmProbeSphere;
 	std::vector<PtsmFlowSample> ptsmFlowSamplesCurrent;
 	std::vector<PtsmFlowSample> ptsmFlowSamplesNext;
+	GalaxyFieldLocal ptsmLastGalaxyField;
 
 	glm::vec3 worldMin = glm::vec3(-1.35f, -1.05f, -1.05f);
 	glm::vec3 worldMax = glm::vec3(1.35f, 1.05f, 1.05f);

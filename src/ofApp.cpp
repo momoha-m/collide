@@ -490,6 +490,7 @@ void ofApp::setupGui() {
 	guiParams.add(ptsmFlowRadiusParam.set("ptsm flow radius", 0.72f, 0.05f, 3.0f));
 	guiParams.add(ptsmFlowVelocityScaleParam.set("ptsm flow scale", 95.0f, 0.0f, 300.0f));
 	guiParams.add(ptsmFlowVerticalMixParam.set("ptsm flow vertical", 0.42f, 0.0f, 1.0f));
+	guiParams.add(ptsmTidalGainParam.set("ptsm tidal gain", 8.0f, 0.0f, 60.0f));
 	guiParams.add(ptsmProbeRadiusParam.set("ptsm radius", ptsmProbeRadius, 0.001f, 0.04f));
 	guiParams.add(ptsmTrailAlphaParam.set("ptsm trail alpha", ptsmTrailAlpha, 0.0f, 255.0f));
 	guiParams.add(ptsmTrailSmoothingParam.set("ptsm trail smooth", ptsmTrailSmoothingSize, 0, 20));
@@ -2358,18 +2359,37 @@ std::vector<ofApp::PtsmFlowSample> ofApp::compressPtsmFlowSamples(const std::vec
 	return compressed;
 }
 
-glm::vec3 ofApp::samplePtsmFlowVelocity(const glm::vec3& position) const {
-	const glm::vec3 currentVelocity = samplePtsmFlowVelocityFromFrame(ptsmFlowSamplesCurrent, position);
+ofApp::GalaxyFieldLocal ofApp::sampleGalaxyField(const glm::vec3& position, const glm::vec3& probeVelocity) const {
+	GalaxyFieldLocal current = sampleGalaxyFieldFromFrame(ptsmFlowSamplesCurrent, position, probeVelocity);
 	if(ptsmFlowSamplesNext.empty()) {
-		return currentVelocity;
+		return current;
 	}
-	const glm::vec3 nextVelocity = samplePtsmFlowVelocityFromFrame(ptsmFlowSamplesNext, position);
-	return glm::mix(currentVelocity, nextVelocity, ofClamp(currentFrameBlend, 0.0f, 1.0f));
+
+	const GalaxyFieldLocal next = sampleGalaxyFieldFromFrame(ptsmFlowSamplesNext, position, probeVelocity);
+	const float blend = ofClamp(currentFrameBlend, 0.0f, 1.0f);
+	GalaxyFieldLocal result;
+	result.flowVelocity = glm::mix(current.flowVelocity, next.flowVelocity, blend);
+	result.gradU = current.gradU * (1.0f - blend) + next.gradU * blend;
+	result.vorticity = glm::mix(current.vorticity, next.vorticity, blend);
+	result.density = glm::mix(current.density, next.density, blend);
+	result.dispersion = glm::mix(current.dispersion, next.dispersion, blend);
+	result.divergence = glm::mix(current.divergence, next.divergence, blend);
+	result.compression = std::max(0.0f, -result.divergence);
+	result.shear = glm::mix(current.shear, next.shear, blend);
+	result.slip = glm::length(result.flowVelocity - probeVelocity);
+	result.vorticityMag = glm::length(result.vorticity);
+	result.valid = current.valid || next.valid;
+	return result;
 }
 
-glm::vec3 ofApp::samplePtsmFlowVelocityFromFrame(const std::vector<PtsmFlowSample>& samples, const glm::vec3& position) const {
+ofApp::GalaxyFieldLocal ofApp::sampleGalaxyFieldFromFrame(
+	const std::vector<PtsmFlowSample>& samples,
+	const glm::vec3& position,
+	const glm::vec3& probeVelocity
+) const {
+	GalaxyFieldLocal result;
 	if(samples.empty()) {
-		return glm::vec3(0.0f);
+		return result;
 	}
 
 	const float radius = std::max(ptsmFlowRadiusParam.get(), std::numeric_limits<float>::epsilon());
@@ -2385,38 +2405,88 @@ glm::vec3 ofApp::samplePtsmFlowVelocityFromFrame(const std::vector<PtsmFlowSampl
 	}
 
 	if(totalWeight <= std::numeric_limits<float>::epsilon()) {
-		return glm::vec3(0.0f);
+		return result;
 	}
-	return weightedVelocity / totalWeight;
+
+	result.flowVelocity = weightedVelocity / totalWeight;
+	result.density = totalWeight / static_cast<float>(std::max<std::size_t>(1, samples.size()));
+
+	glm::mat3 crr(0.0f);
+	glm::mat3 cvr(0.0f);
+	float dispersionSum = 0.0f;
+	for(const auto& sample : samples) {
+		const glm::vec3 r = sample.position - position;
+		const glm::vec3 dv = sample.velocity - result.flowVelocity;
+		const float squaredDistance = glm::dot(r, r);
+		const float weight = std::exp(-squaredDistance / denom);
+		crr += outerProduct(r, r) * weight;
+		cvr += outerProduct(dv, r) * weight;
+		dispersionSum += glm::dot(dv, dv) * weight;
+	}
+
+	const float regularization = std::max(0.0001f, radius * radius * 0.0001f);
+	result.gradU = cvr * glm::inverse(crr + glm::mat3(regularization));
+	result.dispersion = std::sqrt(std::max(0.0f, dispersionSum / totalWeight));
+	result.divergence = result.gradU[0][0] + result.gradU[1][1] + result.gradU[2][2];
+	result.compression = std::max(0.0f, -result.divergence);
+	result.vorticity = glm::vec3(
+		result.gradU[2][1] - result.gradU[1][2],
+		result.gradU[0][2] - result.gradU[2][0],
+		result.gradU[1][0] - result.gradU[0][1]
+	);
+	result.vorticityMag = glm::length(result.vorticity);
+
+	const glm::mat3 strain = (result.gradU + glm::transpose(result.gradU)) * 0.5f;
+	const glm::mat3 deviatoric = strain - glm::mat3(result.divergence / 3.0f);
+	result.shear = frobeniusNorm(deviatoric);
+	result.slip = glm::length(result.flowVelocity - probeVelocity);
+	result.valid = true;
+	return result;
 }
 
 void ofApp::applyPtsmFlowForces(float dt) {
 	if(ptsmFlowCouplingParam <= 0.0f || ptsmEngine.getProbeCount() == 0) {
+		ptsmLastGalaxyField = GalaxyFieldLocal();
 		return;
 	}
 
 	ptsm::ProbeState* probe = ptsmEngine.getMutableProbeState(0);
 	if(probe == nullptr) {
+		ptsmLastGalaxyField = GalaxyFieldLocal();
+		return;
+	}
+
+	GalaxyFieldLocal local = sampleGalaxyField(probe->position, probe->velocity);
+	if(!local.valid) {
+		ptsmLastGalaxyField = local;
 		return;
 	}
 
 	const glm::vec3 localFlowVelocity =
-		samplePtsmFlowVelocity(probe->position) *
+		local.flowVelocity *
 		std::max(0.0f, ptsmFlowVelocityScaleParam.get());
 	const glm::vec3 desiredAcceleration =
 		(localFlowVelocity - probe->velocity) *
 		std::max(0.0f, ptsmFlowCouplingParam.get());
+	const glm::vec3 tidalAcceleration =
+		(local.gradU * probe->velocity) *
+		std::max(0.0f, ptsmTidalGainParam.get());
 	const float mass = std::max(ptsmSettings.probe.mass, std::numeric_limits<float>::epsilon());
 	glm::vec3 flowForce = desiredAcceleration * mass;
+	glm::vec3 tidalForce = tidalAcceleration * mass;
+	glm::vec3 totalForce = flowForce + tidalForce;
 	if(ptsmSettings.probe.maxForce > 0.0f) {
-		const float forceLength = glm::length(flowForce);
+		const float forceLength = glm::length(totalForce);
 		if(forceLength > ptsmSettings.probe.maxForce && forceLength > std::numeric_limits<float>::epsilon()) {
-			flowForce *= ptsmSettings.probe.maxForce / forceLength;
+			const float forceScale = ptsmSettings.probe.maxForce / forceLength;
+			flowForce *= forceScale;
+			tidalForce *= forceScale;
+			totalForce *= forceScale;
 		}
 	}
 
 	const glm::vec3 previousAcceleration = probe->previousAcceleration;
-	const glm::vec3 acceleration = flowForce / mass;
+	const glm::vec3 acceleration = totalForce / mass;
 	probe->velocity += std::max(0.0f, dt) * acceleration;
 	if(ptsmSettings.probe.maxSpeed > 0.0f) {
 		const float speed = glm::length(probe->velocity);
@@ -2427,7 +2497,32 @@ void ofApp::applyPtsmFlowForces(float dt) {
 	const float safeDt = std::max(dt, std::numeric_limits<float>::epsilon());
 	probe->jerk = glm::length(acceleration - previousAcceleration) / safeDt;
 	probe->previousAcceleration = acceleration;
-	probe->field.force += flowForce;
+	probe->field.force += totalForce;
+	local.flowForce = flowForce;
+	local.tidalForce = tidalForce;
+	local.totalForce = probe->field.force;
+	local.slip = glm::length(localFlowVelocity - probe->velocity);
+	ptsmLastGalaxyField = local;
+}
+
+glm::mat3 ofApp::outerProduct(const glm::vec3& a, const glm::vec3& b) const {
+	glm::mat3 result(0.0f);
+	for(int column = 0; column < 3; ++column) {
+		for(int row = 0; row < 3; ++row) {
+			result[column][row] = a[row] * b[column];
+		}
+	}
+	return result;
+}
+
+float ofApp::frobeniusNorm(const glm::mat3& matrix) const {
+	float sum = 0.0f;
+	for(int column = 0; column < 3; ++column) {
+		for(int row = 0; row < 3; ++row) {
+			sum += matrix[column][row] * matrix[column][row];
+		}
+	}
+	return std::sqrt(sum);
 }
 
 glm::vec3 ofApp::randomUnitVector() const {
@@ -2598,6 +2693,7 @@ void ofApp::lockPtsmSpawn() {
 
 void ofApp::clearPtsmProbes() {
 	ptsmEngine.clearProbes();
+	ptsmLastGalaxyField = GalaxyFieldLocal();
 	ptsmTrailCache.clear();
 	ptsmSmoothedTrailCache.clear();
 	ptsmTrailCachedSize = 0;
@@ -2792,6 +2888,44 @@ void ofApp::sendPtsmMetrics() {
 		return;
 	}
 	ofxOscBundle bundle = ptsm::makeProbeMetricsOscBundle(ptsmSettings.osc.prefix, metrics);
+	if(ptsmLastGalaxyField.valid) {
+		const std::string& prefix = ptsmSettings.osc.prefix;
+		const ptsm::ListenerBasis basis = currentListenerBasis();
+		const auto project = [](const glm::vec3& value, const ptsm::ListenerBasis& listener) {
+			return glm::vec3(
+				glm::dot(value, listener.right),
+				glm::dot(value, listener.up),
+				glm::dot(value, listener.forward)
+			);
+		};
+		const glm::vec3 flowBody = project(ptsmLastGalaxyField.flowVelocity, basis);
+		const glm::vec3 totalForceBody = project(ptsmLastGalaxyField.totalForce, basis);
+		const glm::vec3 vorticityBody = project(ptsmLastGalaxyField.vorticity, basis);
+
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/flowX", ptsmLastGalaxyField.flowVelocity.x);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/flowY", ptsmLastGalaxyField.flowVelocity.y);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/flowZ", ptsmLastGalaxyField.flowVelocity.z);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/flowBodyX", flowBody.x);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/flowBodyY", flowBody.y);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/flowBodyZ", flowBody.z);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/forceX", ptsmLastGalaxyField.totalForce.x);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/forceY", ptsmLastGalaxyField.totalForce.y);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/forceZ", ptsmLastGalaxyField.totalForce.z);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/forceBodyX", totalForceBody.x);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/forceBodyY", totalForceBody.y);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/forceBodyZ", totalForceBody.z);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/forceMag", glm::length(ptsmLastGalaxyField.totalForce));
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/slip", ptsmLastGalaxyField.slip);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/density", ptsmLastGalaxyField.density);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/dispersion", ptsmLastGalaxyField.dispersion);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/divergence", ptsmLastGalaxyField.divergence);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/compression", ptsmLastGalaxyField.compression);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/vorticity", ptsmLastGalaxyField.vorticityMag);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/vorticityBodyX", vorticityBody.x);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/vorticityBodyY", vorticityBody.y);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/vorticityBodyZ", vorticityBody.z);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/shear", ptsmLastGalaxyField.shear);
+	}
 	ptsmOscSender.sendBundle(bundle);
 }
 
@@ -3115,6 +3249,15 @@ void ofApp::drawHud() const {
 			<< "  sigma=" << ptsmSettings.field.sigma
 			<< "  gain=" << ptsmSettings.field.fieldGain
 			<< "  flowFollow=" << ptsmFlowCouplingParam.get();
+		if(ptsmLastGalaxyField.valid) {
+			text << '\n'
+				<< "galaxyField"
+				<< "  slip=" << ptsmLastGalaxyField.slip
+				<< "  div=" << ptsmLastGalaxyField.divergence
+				<< "  vort=" << ptsmLastGalaxyField.vorticityMag
+				<< "  shear=" << ptsmLastGalaxyField.shear
+				<< "  disp=" << ptsmLastGalaxyField.dispersion;
+		}
 	} else {
 		text << statusMessage;
 	}
