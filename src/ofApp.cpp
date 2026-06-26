@@ -478,19 +478,22 @@ void ofApp::setupGui() {
 	ptsmSettings.probe.boundsMin = glm::vec3(-4.0f);
 	ptsmSettings.probe.boundsMax = glm::vec3(4.0f);
 	ptsmSettings.probe.boundaryBounce = 0.92f;
-	ptsmSettings.probe.maxForce = 34.0f;
-	ptsmSettings.probe.maxSpeed = 3.4f;
+	ptsmSettings.probe.maxForce = 80.0f;
+	ptsmSettings.probe.maxSpeed = 4.2f;
 	ptsmSettings.injection.maxKineticEnergy = 1.35f;
 	ptsmSettings.injection.energyRatio = 0.94f;
 	ptsmSettings.osc.enabled = false;
 	ptsmGui.setup(ptsmSettings, "ptsm");
 	guiParams.add(ptsmGui.parameters);
 	guiParams.add(ptsmDensityMixParam.set("ptsm density mix", 0.18f, 0.0f, 1.0f));
-	guiParams.add(ptsmFlowCouplingParam.set("ptsm flow follow", 24.0f, 0.0f, 80.0f));
-	guiParams.add(ptsmFlowRadiusParam.set("ptsm flow radius", 0.72f, 0.05f, 3.0f));
-	guiParams.add(ptsmFlowVelocityScaleParam.set("ptsm flow scale", 95.0f, 0.0f, 300.0f));
-	guiParams.add(ptsmFlowVerticalMixParam.set("ptsm flow vertical", 0.42f, 0.0f, 1.0f));
-	guiParams.add(ptsmTidalGainParam.set("ptsm tidal gain", 8.0f, 0.0f, 60.0f));
+	guiParams.add(ptsmFlowCouplingParam.set("ptsm flow follow", 16.0f, 0.0f, 80.0f));
+	guiParams.add(ptsmFlowRadiusParam.set("ptsm flow radius", 0.38f, 0.05f, 3.0f));
+	guiParams.add(ptsmFlowVelocityScaleParam.set("ptsm flow scale", 130.0f, 0.0f, 300.0f));
+	guiParams.add(ptsmFlowVerticalMixParam.set("ptsm flow vertical", 0.68f, 0.0f, 1.0f));
+	guiParams.add(ptsmTidalGainParam.set("ptsm tidal gain", 22.0f, 0.0f, 120.0f));
+	guiParams.add(ptsmVorticityGainParam.set("ptsm vortex gain", 18.0f, 0.0f, 120.0f));
+	guiParams.add(ptsmCompressionGainParam.set("ptsm compress gain", 16.0f, 0.0f, 120.0f));
+	guiParams.add(ptsmDispersionGainParam.set("ptsm disperse gain", 9.0f, 0.0f, 120.0f));
 	guiParams.add(ptsmProbeRadiusParam.set("ptsm radius", ptsmProbeRadius, 0.001f, 0.04f));
 	guiParams.add(ptsmTrailAlphaParam.set("ptsm trail alpha", ptsmTrailAlpha, 0.0f, 255.0f));
 	guiParams.add(ptsmTrailSmoothingParam.set("ptsm trail smooth", ptsmTrailSmoothingSize, 0, 20));
@@ -2462,18 +2465,49 @@ void ofApp::applyPtsmFlowForces(float dt) {
 		return;
 	}
 
-	const glm::vec3 localFlowVelocity =
-		local.flowVelocity *
-		std::max(0.0f, ptsmFlowVelocityScaleParam.get());
+	const float fieldScale = std::max(0.0f, ptsmFlowVelocityScaleParam.get());
+	const glm::vec3 localFlowVelocity = local.flowVelocity * fieldScale;
+	const glm::vec3 slipVector = localFlowVelocity - probe->velocity;
+	const glm::vec3 slipDirection = glm::length(slipVector) > std::numeric_limits<float>::epsilon()
+		? glm::normalize(slipVector)
+		: randomUnitVector();
+	const glm::vec3 velocityDirection = glm::length(probe->velocity) > std::numeric_limits<float>::epsilon()
+		? glm::normalize(probe->velocity)
+		: slipDirection;
 	const glm::vec3 desiredAcceleration =
-		(localFlowVelocity - probe->velocity) *
+		slipVector *
 		std::max(0.0f, ptsmFlowCouplingParam.get());
 	const glm::vec3 tidalAcceleration =
 		(local.gradU * probe->velocity) *
+		fieldScale *
 		std::max(0.0f, ptsmTidalGainParam.get());
+	glm::vec3 vortexAxis = local.vorticity;
+	if(glm::length(vortexAxis) > std::numeric_limits<float>::epsilon()) {
+		vortexAxis = glm::normalize(vortexAxis);
+	}
+	const glm::vec3 vortexAcceleration =
+		glm::cross(vortexAxis, velocityDirection) *
+		local.vorticityMag *
+		fieldScale *
+		std::max(0.0f, ptsmVorticityGainParam.get());
+	const glm::vec3 compressionAcceleration =
+		slipDirection *
+		local.compression *
+		fieldScale *
+		std::max(0.0f, ptsmCompressionGainParam.get());
+	const glm::vec3 dispersionAcceleration =
+		(glm::normalize(slipDirection + velocityDirection * 0.35f)) *
+		local.dispersion *
+		fieldScale *
+		std::max(0.0f, ptsmDispersionGainParam.get());
 	const float mass = std::max(ptsmSettings.probe.mass, std::numeric_limits<float>::epsilon());
 	glm::vec3 flowForce = desiredAcceleration * mass;
-	glm::vec3 tidalForce = tidalAcceleration * mass;
+	glm::vec3 tidalForce = (
+		tidalAcceleration +
+		vortexAcceleration +
+		compressionAcceleration +
+		dispersionAcceleration
+	) * mass;
 	glm::vec3 totalForce = flowForce + tidalForce;
 	if(ptsmSettings.probe.maxForce > 0.0f) {
 		const float forceLength = glm::length(totalForce);

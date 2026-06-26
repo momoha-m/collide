@@ -235,6 +235,9 @@ private:
 	ofParameter<float> ptsmFlowVelocityScaleParam;
 	ofParameter<float> ptsmFlowVerticalMixParam;
 	ofParameter<float> ptsmTidalGainParam;
+	ofParameter<float> ptsmVorticityGainParam;
+	ofParameter<float> ptsmCompressionGainParam;
+	ofParameter<float> ptsmDispersionGainParam;
 
 	ptsm::Settings ptsmSettings;
 	ptsm::GuiBindings ptsmGui;
