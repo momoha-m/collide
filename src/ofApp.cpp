@@ -26,6 +26,23 @@ constexpr float kCameraMaxDistance = 80.0f;
 constexpr float kCameraNearClip = 0.0001f;
 constexpr float kCameraFarClip = 10000.0f;
 
+struct VoxelAccumulator {
+	glm::vec3 sum = glm::vec3(0.0f);
+	int count = 0;
+};
+
+using VoxelKey = std::array<int, 3>;
+
+struct VoxelKeyHash {
+	std::size_t operator()(const VoxelKey& key) const {
+		std::size_t seed = 0;
+		for(int value : key) {
+			seed ^= std::hash<int>{}(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+		}
+		return seed;
+	}
+};
+
 std::uint64_t fnv1aAppend(std::uint64_t seed, const void* data, std::size_t size);
 
 std::uint64_t fnv1aAppend(std::uint64_t seed, const void* data, std::size_t size) {
@@ -128,6 +145,7 @@ void ofApp::setup() {
 
 	setupGui();
 	setupPointShader();
+	setupPtsm();
 
 	resetCameraView();
 	cameraTimeline.setup(&cam);
@@ -181,6 +199,7 @@ void ofApp::update() {
 		rotationDegrees += static_cast<float>(deltaSeconds) * 6.0f;
 	}
 
+	const double previousPlaybackFramePosition = playbackFramePosition;
 	if(playing) {
 		updatePlaybackPosition(deltaSeconds);
 	}
@@ -190,6 +209,34 @@ void ofApp::update() {
 	constrainCameraDistance();
 	syncDisplaySettings();
 	prepareAheadFrameTexture();
+	syncPtsmSettings();
+	rebuildPtsmFieldIfNeeded();
+	if(ptsmGui.enabled && ptsmEngine.getProbeCount() > 0) {
+		ptsmEngine.setFramePosition(currentFrameBlend);
+		if(playing) {
+			const double frameCount = static_cast<double>(std::max<std::size_t>(1, renderFrames.size()));
+			double playbackDeltaFrames = playbackFramePosition - previousPlaybackFramePosition;
+			if(playbackDeltaFrames < -frameCount * 0.5) {
+				playbackDeltaFrames += frameCount;
+			} else if(playbackDeltaFrames > frameCount * 0.5) {
+				playbackDeltaFrames -= frameCount;
+			}
+			const float referenceDeltaFrames = 3.0f / 60.0f;
+			const float playbackScale = referenceDeltaFrames > 0.0f
+				? static_cast<float>(std::abs(playbackDeltaFrames)) / referenceDeltaFrames
+				: 1.0f;
+			if(playbackScale > 0.0f) {
+				ptsmEngine.update(
+					ptsmSettings.probe.dt *
+					static_cast<float>(std::max(1, ptsmSettings.probe.substeps)) *
+					playbackScale
+				);
+				updatePtsmDisplayState(deltaSeconds);
+			}
+		}
+		updateCameraFromPtsmProbe();
+		sendPtsmMetrics();
+	}
 }
 
 void ofApp::draw() {
@@ -198,13 +245,14 @@ void ofApp::draw() {
 	if(preloadReady && frameTexture.isAllocated()) {
 		cam.begin();
 		ofPushMatrix();
-		if(autoRotateParam || std::abs(rotationDegrees) > 0.0001f) {
+		if(cameraMode == 0 && (autoRotateParam || std::abs(rotationDegrees) > 0.0001f)) {
 			ofRotateYDeg(rotationDegrees);
 		}
 		if(showBoundsParam) {
 			drawBounds();
 		}
 		drawPointCloud();
+		drawPtsmProbes();
 		ofPopMatrix();
 		cam.end();
 	}
@@ -312,12 +360,50 @@ void ofApp::keyPressed(int key) {
 		cameraTimeline.refreshBaseCamera();
 		return;
 	}
+	if(key == 'R') {
+		resetAllState();
+		return;
+	}
 	if(key == 'f') {
 		fullResolutionParam = !fullResolutionParam.get();
 		return;
 	}
 	if(key == 'p') {
 		performanceModeParam = !performanceModeParam.get();
+		return;
+	}
+	if(key == 'i') {
+		spawnPtsmProbe();
+		return;
+	}
+	if(key == 'N') {
+		ptsmCurrentSpawnPosition.reset();
+		ptsmCurrentSpawnVelocity.reset();
+		ptsmLockedSpawnPosition.reset();
+		ptsmLockedSpawnVelocity.reset();
+		spawnPtsmProbe();
+		return;
+	}
+	if(key == 'B') {
+		lockPtsmSpawn();
+		return;
+	}
+	if(key == 'I') {
+		clearPtsmProbes();
+		return;
+	}
+	if(key == 'V') {
+		cameraMode = (cameraMode + 1) % 2;
+		cameraStateInitialized = false;
+		if(cameraMode == 0) {
+			resetCameraView();
+			cameraTimeline.refreshBaseCamera();
+			cam.enableMouseInput();
+		} else {
+			cam.disableMouseInput();
+			updateCameraFromPtsmProbe();
+		}
+		statusMessage = "Camera " + cameraModeLabel();
 		return;
 	}
 	if(key == '0') {
@@ -372,6 +458,29 @@ void ofApp::setupGui() {
 	guiParams.add(showBoundsParam.set("bounds", false));
 	guiParams.add(autoRotateParam.set("autoRotate", false));
 	guiParams.add(showGuiParam.set("gui", true));
+	ptsmSettings = ptsm::Settings::paper3D();
+	ptsmSettings.field.sigma = 0.62f;
+	ptsmSettings.field.fieldGain = 85.0f;
+	ptsmSettings.field.sampleCount = 4000;
+	ptsmSettings.field.normalizeByAttractorCount = true;
+	ptsmSettings.probe.dt = 0.0005f;
+	ptsmSettings.probe.energyRetention = 0.99945f;
+	ptsmSettings.probe.substeps = 4;
+	ptsmSettings.probe.trailLength = 12000;
+	ptsmSettings.probe.boundsEnabled = true;
+	ptsmSettings.probe.boundsMin = glm::vec3(-4.0f);
+	ptsmSettings.probe.boundsMax = glm::vec3(4.0f);
+	ptsmSettings.probe.boundaryBounce = 0.92f;
+	ptsmSettings.probe.maxForce = 34.0f;
+	ptsmSettings.probe.maxSpeed = 3.4f;
+	ptsmSettings.injection.maxKineticEnergy = 1.35f;
+	ptsmSettings.injection.energyRatio = 0.94f;
+	ptsmSettings.osc.enabled = false;
+	ptsmGui.setup(ptsmSettings, "ptsm");
+	guiParams.add(ptsmGui.parameters);
+	guiParams.add(ptsmProbeRadiusParam.set("ptsm radius", ptsmProbeRadius, 0.001f, 0.04f));
+	guiParams.add(ptsmTrailAlphaParam.set("ptsm trail alpha", ptsmTrailAlpha, 0.0f, 255.0f));
+	guiParams.add(ptsmTrailSmoothingParam.set("ptsm trail smooth", ptsmTrailSmoothingSize, 0, 20));
 	gui.setup(guiParams);
 	gui.setPosition(18, 18);
 
@@ -641,6 +750,13 @@ void ofApp::setupPointShader() {
 	pointShader.setupShaderFromSource(GL_FRAGMENT_SHADER, fragmentShader);
 	pointShader.bindDefaults();
 	pointShader.linkProgram();
+}
+
+void ofApp::setupPtsm() {
+	ptsmEngine.setFieldModel(&ptsmField);
+	ptsmProbeSphere.setRadius(ptsmProbeRadius);
+	ptsmProbeSphere.setResolution(8);
+	syncPtsmSettings();
 }
 
 std::string ofApp::resolveDataDirectoryPath() const {
@@ -1872,6 +1988,19 @@ glm::vec3 ofApp::transformCachedPositionForDisplay(const glm::vec3& position) co
 	return (position - displayNormalizationCenter) * displayNormalizationScale;
 }
 
+glm::vec3 ofApp::transformCachedPositionForPtsm(const glm::vec3& position) const {
+	return transformCachedPositionForDisplay(position) *
+		std::max(sceneScaleParam.get(), 0.001f) *
+		std::max(coreScaleParam.get(), 0.001f);
+}
+
+void ofApp::getVisibleBounds(glm::vec3& boundsMin, glm::vec3& boundsMax) const {
+	const float scale = std::max(sceneScaleParam.get(), 0.001f) *
+		std::max(coreScaleParam.get(), 0.001f);
+	boundsMin = worldMin * scale;
+	boundsMax = worldMax * scale;
+}
+
 void ofApp::resetCameraView() {
 	cam.setAutoDistance(false);
 	const float sceneScale = std::max(sceneScaleParam.get(), 0.001f);
@@ -1914,6 +2043,556 @@ void ofApp::constrainCameraDistance() {
 	}
 	cam.setNearClip(kCameraNearClip);
 	cam.setFarClip(kCameraFarClip);
+}
+
+void ofApp::syncPtsmSettings() {
+	if(!ptsmGui.enabled) {
+		return;
+	}
+
+	ptsmGui.applyTo(ptsmSettings);
+	ptsmSettings.field.normalizeByAttractorCount = true;
+	ptsmField.setSigma(ptsmSettings.field.sigma);
+	ptsmField.setFieldGain(ptsmSettings.field.fieldGain);
+	ptsmField.setNormalizeByAttractorCount(ptsmSettings.field.normalizeByAttractorCount);
+
+	ptsm::ProbeEngineConfig config;
+	config.mass = ptsmSettings.probe.mass;
+	config.energyRetention = ptsmSettings.probe.energyRetention;
+	config.substeps = ptsmSettings.probe.substeps;
+	config.trailLength = ptsmSettings.probe.trailLength;
+	config.boundsEnabled = ptsmSettings.probe.boundsEnabled;
+	getVisibleBounds(config.boundsMin, config.boundsMax);
+	config.boundaryBounce = ptsmSettings.probe.boundaryBounce;
+	config.maxForce = ptsmSettings.probe.maxForce;
+	config.maxSpeed = ptsmSettings.probe.maxSpeed;
+	ptsmEngine.setConfig(config);
+
+	const float newProbeRadius = ptsmProbeRadiusParam;
+	const float newTrailAlpha = ptsmTrailAlphaParam;
+	const int newTrailSmoothing = ptsmTrailSmoothingParam;
+	if(std::abs(ptsmProbeRadius - newProbeRadius) > 0.000001f) {
+		ptsmProbeRadius = newProbeRadius;
+		ptsmProbeSphere.setRadius(ptsmProbeRadius);
+	}
+	ptsmTrailAlpha = newTrailAlpha;
+	if(ptsmTrailSmoothingSize != newTrailSmoothing) {
+		ptsmTrailSmoothingSize = newTrailSmoothing;
+		ptsmTrailCachedSize = 0;
+	}
+
+	if(ptsmSettings.osc.enabled && !ptsmOscReady) {
+		ptsmOscSender.setup(ptsmSettings.osc.host, ptsmSettings.osc.port);
+		ptsmOscReady = true;
+	}
+}
+
+void ofApp::rebuildPtsmFieldIfNeeded() {
+	if(!ptsmGui.enabled || renderFrames.empty() || currentFrameIndex >= renderFrames.size()) {
+		return;
+	}
+
+	const int sampleCount = std::max(1, ptsmGui.sampleCount.get());
+	const float sceneScale = sceneScaleParam.get();
+	const float viewScale = coreScaleParam.get();
+	const bool spawnSettingsChanged =
+		ptsmLastSampleCount >= 0 &&
+		(ptsmLastSampleCount != sampleCount ||
+		 std::abs(ptsmLastSceneScale - sceneScale) > 0.0001f ||
+		 std::abs(ptsmLastViewScale - viewScale) > 0.0001f);
+	if(ptsmFieldFrameIndex == currentFrameIndex &&
+	   ptsmLastSampleCount == sampleCount &&
+	   std::abs(ptsmLastSceneScale - sceneScale) <= 0.0001f &&
+	   std::abs(ptsmLastViewScale - viewScale) <= 0.0001f) {
+		ptsmEngine.setFramePosition(currentFrameBlend);
+		return;
+	}
+	if(spawnSettingsChanged) {
+		ptsmCurrentSpawnPosition.reset();
+		ptsmCurrentSpawnVelocity.reset();
+		ptsmLockedSpawnPosition.reset();
+		ptsmLockedSpawnVelocity.reset();
+	}
+
+	std::vector<glm::vec3> currentAttractors;
+	std::vector<glm::vec3> nextAttractors;
+	if(!buildPtsmFrame(currentFrameIndex, currentAttractors) || currentAttractors.empty()) {
+		return;
+	}
+
+	const std::size_t nextFrameIndex = renderFrames.size() > 1
+		? (currentFrameIndex + 1) % renderFrames.size()
+		: currentFrameIndex;
+	if(!buildPtsmFrame(nextFrameIndex, nextAttractors) || nextAttractors.empty()) {
+		nextAttractors = currentAttractors;
+	}
+
+	ptsmField.setFrames({currentAttractors, nextAttractors});
+	ptsmEngine.setFramePosition(currentFrameBlend);
+	ptsmFieldFrameIndex = currentFrameIndex;
+	ptsmLastSampleCount = sampleCount;
+	ptsmLastSceneScale = sceneScale;
+	ptsmLastViewScale = viewScale;
+}
+
+bool ofApp::buildPtsmFrame(std::size_t frameIndex, std::vector<glm::vec3>& attractors) const {
+	attractors.clear();
+	if(frameIndex >= renderFrames.size()) {
+		return false;
+	}
+
+	std::vector<RenderParticle> particles;
+	if(const auto* cached = findRamCachedFrame(frameIndex)) {
+		particles = *cached;
+	} else if(!loadCachedFrameData(frameIndex, &particles)) {
+		return false;
+	}
+
+	std::vector<glm::vec3> candidates;
+	candidates.reserve(particles.size());
+	for(const auto& particle : particles) {
+		const int type = static_cast<int>(std::floor(particle.typeIntensity + 0.0001f));
+		if(!typeUsedForDisplayNormalization(type) || !particleTypeEnabled(type)) {
+			continue;
+		}
+		const glm::vec3 position = transformCachedPositionForPtsm(particle.position);
+		if(std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z)) {
+			candidates.push_back(position);
+		}
+	}
+
+	if(candidates.empty()) {
+		candidates.reserve(particles.size());
+		for(const auto& particle : particles) {
+			const glm::vec3 position = transformCachedPositionForPtsm(particle.position);
+			if(std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z)) {
+				candidates.push_back(position);
+			}
+		}
+	}
+
+	attractors = compressPtsmAttractors(candidates, std::max(1, ptsmGui.sampleCount.get()));
+	return !attractors.empty();
+}
+
+std::vector<glm::vec3> ofApp::compressPtsmAttractors(const std::vector<glm::vec3>& points, int maxAttractors) const {
+	if(points.empty()) {
+		return {};
+	}
+	if(static_cast<int>(points.size()) <= maxAttractors) {
+		return points;
+	}
+
+	glm::vec3 srcMin(std::numeric_limits<float>::max());
+	glm::vec3 srcMax(std::numeric_limits<float>::lowest());
+	for(const auto& point : points) {
+		srcMin = glm::min(srcMin, point);
+		srcMax = glm::max(srcMax, point);
+	}
+
+	const glm::vec3 srcSize = glm::max(srcMax - srcMin, glm::vec3(std::numeric_limits<float>::epsilon()));
+	int gridResolution = 8;
+	std::vector<glm::vec3> compressed;
+
+	while(true) {
+		std::unordered_map<VoxelKey, VoxelAccumulator, VoxelKeyHash> voxels;
+		voxels.reserve(points.size() / 2);
+
+		for(const auto& point : points) {
+			const glm::vec3 normalized = (point - srcMin) / srcSize;
+			const VoxelKey key = {
+				std::min(gridResolution - 1, std::max(0, static_cast<int>(normalized.x * gridResolution))),
+				std::min(gridResolution - 1, std::max(0, static_cast<int>(normalized.y * gridResolution))),
+				std::min(gridResolution - 1, std::max(0, static_cast<int>(normalized.z * gridResolution)))
+			};
+			auto& voxel = voxels[key];
+			voxel.sum += point;
+			++voxel.count;
+		}
+
+		compressed.clear();
+		compressed.reserve(voxels.size());
+		for(const auto& entry : voxels) {
+			const VoxelAccumulator& voxel = entry.second;
+			compressed.push_back(voxel.sum / static_cast<float>(std::max(1, voxel.count)));
+		}
+
+		if(static_cast<int>(compressed.size()) <= maxAttractors || gridResolution <= 2) {
+			break;
+		}
+		gridResolution = std::max(2, gridResolution - 1);
+	}
+
+	return compressed;
+}
+
+glm::vec3 ofApp::randomUnitVector() const {
+	glm::vec3 direction(ofRandomf(), ofRandomf(), ofRandomf());
+	const float length = glm::length(direction);
+	if(length <= std::numeric_limits<float>::epsilon()) {
+		return glm::vec3(1.0f, 0.0f, 0.0f);
+	}
+	return direction / length;
+}
+
+void ofApp::samplePtsmAuditionSpawn(glm::vec3& position, glm::vec3& velocity) const {
+	glm::vec3 boundsMin(0.0f);
+	glm::vec3 boundsMax(0.0f);
+	getVisibleBounds(boundsMin, boundsMax);
+	const glm::vec3 boundsSize = glm::max(boundsMax - boundsMin, glm::vec3(std::numeric_limits<float>::epsilon()));
+	const glm::vec3 center = 0.5f * (boundsMin + boundsMax);
+
+	auto launchFromLowerRight = [&](const glm::vec3& target) {
+		position = glm::vec3(
+			boundsMax.x - boundsSize.x * ofRandom(0.06f, 0.16f),
+			boundsMin.y + boundsSize.y * ofRandom(0.22f, 0.38f),
+			boundsMin.z + boundsSize.z * ofRandom(0.34f, 0.66f)
+		);
+		const glm::vec3 primary = glm::normalize(target - position);
+		glm::vec3 side = glm::cross(primary, glm::vec3(0.0f, 1.0f, 0.0f));
+		if(glm::dot(side, side) <= std::numeric_limits<float>::epsilon()) {
+			side = glm::cross(primary, glm::vec3(1.0f, 0.0f, 0.0f));
+		}
+		side = glm::normalize(side);
+		const glm::vec3 up = glm::normalize(glm::cross(side, primary));
+		const glm::vec3 direction = glm::normalize(
+			primary * 0.93f +
+			side * ofRandom(-0.12f, 0.18f) +
+			up * ofRandom(0.02f, 0.16f)
+		);
+		const float mass = std::max(ptsmSettings.probe.mass, std::numeric_limits<float>::epsilon());
+		const float kinetic = ptsmSettings.injection.maxKineticEnergy * ptsmSettings.injection.energyRatio;
+		const float speed = std::sqrt(std::max(0.0f, 2.0f * kinetic / mass));
+		velocity = direction * speed;
+	};
+
+	static const std::vector<glm::vec3> emptyAttractors;
+	const auto& attractors = ptsmField.getFrameCount() > 0 ? ptsmField.getFrame(0) : emptyAttractors;
+	if(attractors.size() >= 32) {
+		glm::vec3 mean(0.0f);
+		for(const auto& point : attractors) {
+			mean += point;
+		}
+		mean /= static_cast<float>(attractors.size());
+
+		glm::vec3 variance(0.0f);
+		for(const auto& point : attractors) {
+			const glm::vec3 delta = point - mean;
+			variance += delta * delta;
+		}
+		int axis = 0;
+		if(variance.y > variance.x && variance.y >= variance.z) {
+			axis = 1;
+		} else if(variance.z > variance.x && variance.z > variance.y) {
+			axis = 2;
+		}
+
+		glm::vec3 lowSum(0.0f);
+		glm::vec3 highSum(0.0f);
+		std::size_t lowCount = 0;
+		std::size_t highCount = 0;
+		for(const auto& point : attractors) {
+			if(point[axis] < mean[axis]) {
+				lowSum += point;
+				++lowCount;
+			} else {
+				highSum += point;
+				++highCount;
+			}
+		}
+
+		if(lowCount > 0 && highCount > 0) {
+			const glm::vec3 lowCenter = lowSum / static_cast<float>(lowCount);
+			const glm::vec3 highCenter = highSum / static_cast<float>(highCount);
+			const glm::vec3 lowerRightReference(
+				boundsMax.x,
+				boundsMin.y,
+				center.z
+			);
+			const float lowDistance = glm::distance2(lowCenter, lowerRightReference);
+			const float highDistance = glm::distance2(highCenter, lowerRightReference);
+			const glm::vec3 targetCenter = lowDistance < highDistance ? highCenter : lowCenter;
+			launchFromLowerRight(targetCenter);
+			return;
+		}
+	}
+
+	launchFromLowerRight(center);
+}
+
+void ofApp::choosePtsmSpawn(glm::vec3& position, glm::vec3& velocity) {
+	if(ptsmLockedSpawnPosition.has_value() && ptsmLockedSpawnVelocity.has_value()) {
+		position = *ptsmLockedSpawnPosition;
+		velocity = *ptsmLockedSpawnVelocity;
+		return;
+	}
+	if(!ptsmCurrentSpawnPosition.has_value() || !ptsmCurrentSpawnVelocity.has_value()) {
+		samplePtsmAuditionSpawn(position, velocity);
+		ptsmCurrentSpawnPosition = position;
+		ptsmCurrentSpawnVelocity = velocity;
+		return;
+	}
+	position = *ptsmCurrentSpawnPosition;
+	velocity = *ptsmCurrentSpawnVelocity;
+}
+
+void ofApp::spawnPtsmProbe() {
+	if(!preloadReady || renderFrames.empty()) {
+		statusMessage = "PTSM needs loaded frames";
+		return;
+	}
+
+	syncPtsmSettings();
+	rebuildPtsmFieldIfNeeded();
+	if(ptsmField.getFrameCount() == 0 || ptsmField.getFrame(0).empty()) {
+		statusMessage = "PTSM field has no attractors";
+		return;
+	}
+
+	glm::vec3 origin(0.0f);
+	glm::vec3 velocity(0.0f);
+	choosePtsmSpawn(origin, velocity);
+	const float speed = glm::length(velocity);
+	const glm::vec3 direction = speed > std::numeric_limits<float>::epsilon()
+		? velocity / speed
+		: randomUnitVector();
+	clearPtsmProbes();
+	ptsmEngine.spawnProbe(origin, velocity);
+	ptsmDisplayPosition = origin;
+	ptsmDisplayVelocity = velocity;
+	cameraForward = direction;
+	const glm::vec3 desiredRight = glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), cameraForward);
+	if(glm::dot(desiredRight, desiredRight) > std::numeric_limits<float>::epsilon()) {
+		cameraRight = glm::normalize(desiredRight);
+	}
+	cameraStateInitialized = false;
+	ptsmTrailCachedSize = 0;
+	statusMessage = "Injected PTSM probe " + ofToString(ptsmEngine.getProbeCount());
+}
+
+void ofApp::lockPtsmSpawn() {
+	if(!ptsmCurrentSpawnPosition.has_value() || !ptsmCurrentSpawnVelocity.has_value()) {
+		glm::vec3 position(0.0f);
+		glm::vec3 velocity(0.0f);
+		samplePtsmAuditionSpawn(position, velocity);
+		ptsmCurrentSpawnPosition = position;
+		ptsmCurrentSpawnVelocity = velocity;
+	}
+
+	ptsmLockedSpawnPosition = ptsmCurrentSpawnPosition;
+	ptsmLockedSpawnVelocity = ptsmCurrentSpawnVelocity;
+	statusMessage = "Locked PTSM spawn";
+	ofLogNotice() << "[collide-vis] Locked PTSM spawn at "
+		<< ptsmLockedSpawnPosition->x << ", "
+		<< ptsmLockedSpawnPosition->y << ", "
+		<< ptsmLockedSpawnPosition->z
+		<< " velocity "
+		<< ptsmLockedSpawnVelocity->x << ", "
+		<< ptsmLockedSpawnVelocity->y << ", "
+		<< ptsmLockedSpawnVelocity->z;
+}
+
+void ofApp::clearPtsmProbes() {
+	ptsmEngine.clearProbes();
+	ptsmTrailCache.clear();
+	ptsmSmoothedTrailCache.clear();
+	ptsmTrailCachedSize = 0;
+	statusMessage = "Cleared PTSM probes";
+}
+
+void ofApp::resetAllState() {
+	playing = false;
+	playbackFramePosition = 0.0;
+	currentFrameIndex = 0;
+	currentFrameBlend = 0.0f;
+	rotationDegrees = 0.0f;
+	lastRotationCueWeight = 0.0f;
+
+	clearPtsmProbes();
+	ptsmCurrentSpawnPosition.reset();
+	ptsmCurrentSpawnVelocity.reset();
+	ptsmLockedSpawnPosition.reset();
+	ptsmLockedSpawnVelocity.reset();
+	ptsmDisplayPosition = glm::vec3(0.0f);
+	ptsmDisplayVelocity = glm::vec3(0.0f);
+
+	cameraMode = 0;
+	cameraForward = glm::vec3(0.0f, 0.0f, -1.0f);
+	cameraRight = glm::vec3(1.0f, 0.0f, 0.0f);
+	smoothedCameraPosition = glm::vec3(0.0f);
+	smoothedCameraTarget = glm::vec3(0.0f);
+	cameraStateInitialized = false;
+
+	if(preloadReady && !renderFrames.empty()) {
+		applyPlaybackPosition(true);
+		syncFrameState();
+	}
+	resetCameraView();
+	cameraTimeline.refreshBaseCamera();
+	lastUpdateTime = ofGetElapsedTimef();
+	statusMessage = "Reset all";
+}
+
+void ofApp::updatePtsmDisplayState(double deltaSeconds) {
+	const ptsm::ProbeState* probe = ptsmEngine.getProbeState(0);
+	if(probe == nullptr) {
+		return;
+	}
+
+	const float normalizedDelta = static_cast<float>(std::max(0.0, deltaSeconds) * 60.0);
+	const float blend = 1.0f - std::pow(
+		1.0f - ofClamp(particleDisplaySmoothing, 0.0f, 0.999f),
+		normalizedDelta
+	);
+	ptsmDisplayPosition = glm::mix(ptsmDisplayPosition, probe->position, blend);
+	ptsmDisplayVelocity = glm::mix(ptsmDisplayVelocity, probe->velocity, blend);
+}
+
+void ofApp::updateCameraFromPtsmProbe() {
+	if(cameraMode == 0 || ptsmEngine.getProbeCount() == 0) {
+		return;
+	}
+
+	const float speedSquared = glm::dot(ptsmDisplayVelocity, ptsmDisplayVelocity);
+	if(speedSquared > std::numeric_limits<float>::epsilon()) {
+		const glm::vec3 desiredForward = glm::normalize(ptsmDisplayVelocity);
+		const float blend = ofClamp(cameraTurnSmoothing, 0.0f, 1.0f);
+		cameraForward = glm::normalize(glm::mix(cameraForward, desiredForward, blend));
+	}
+
+	const glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+	glm::vec3 desiredRight = glm::cross(worldUp, cameraForward);
+	if(glm::dot(desiredRight, desiredRight) <= std::numeric_limits<float>::epsilon()) {
+		desiredRight = cameraRight;
+	} else {
+		desiredRight = glm::normalize(desiredRight);
+	}
+
+	const float rightBlend = ofClamp(cameraTurnSmoothing * 0.8f, 0.0f, 1.0f);
+	cameraRight = glm::normalize(glm::mix(cameraRight, desiredRight, rightBlend));
+	const glm::vec3 up = glm::normalize(glm::cross(cameraForward, cameraRight));
+
+	const glm::vec3 eyePosition = ptsmDisplayPosition + cameraForward * firstPersonEyeOffset;
+	const glm::vec3 targetPosition = eyePosition + cameraForward * firstPersonLookAhead;
+	if(!cameraStateInitialized) {
+		smoothedCameraPosition = eyePosition;
+		smoothedCameraTarget = targetPosition;
+		cameraStateInitialized = true;
+	} else {
+		smoothedCameraPosition = glm::mix(
+			smoothedCameraPosition,
+			eyePosition,
+			ofClamp(cameraPositionSmoothing, 0.0f, 1.0f)
+		);
+		smoothedCameraTarget = glm::mix(
+			smoothedCameraTarget,
+			targetPosition,
+			ofClamp(cameraTargetSmoothing, 0.0f, 1.0f)
+		);
+	}
+
+	cam.setPosition(smoothedCameraPosition);
+	cam.lookAt(smoothedCameraTarget, up);
+}
+
+void ofApp::rebuildPtsmTrailCache(const ptsm::ProbeState& probe) {
+	ptsmTrailCache.clear();
+	ptsmSmoothedTrailCache.clear();
+	if(probe.trail.empty()) {
+		ptsmTrailCachedSize = 0;
+		return;
+	}
+
+	const std::size_t stride = std::max<std::size_t>(
+		1,
+		probe.trail.size() / static_cast<std::size_t>(ptsmMaxTrailDrawPoints)
+	);
+	std::size_t index = 0;
+	for(const auto& point : probe.trail) {
+		if(index % stride == 0 || index + 1 == probe.trail.size()) {
+			ptsmTrailCache.addVertex(point);
+		}
+		++index;
+	}
+
+	if(ptsmTrailSmoothingSize > 0 &&
+	   ptsmTrailCache.size() > static_cast<std::size_t>(ptsmTrailSmoothingSize + 2)) {
+		ptsmSmoothedTrailCache = ptsmTrailCache.getSmoothed(ptsmTrailSmoothingSize, 0.5f);
+	}
+	ptsmTrailCachedSize = probe.trail.size();
+}
+
+ptsm::ListenerBasis ofApp::currentListenerBasis() const {
+	const auto normalizeOr = [](const glm::vec3& value, const glm::vec3& fallback) {
+		const float length = glm::length(value);
+		return length > std::numeric_limits<float>::epsilon() ? value / length : fallback;
+	};
+
+	ptsm::ListenerBasis basis;
+	if(cameraMode != 0) {
+		basis.right = normalizeOr(cameraRight, glm::vec3(1.0f, 0.0f, 0.0f));
+		basis.forward = normalizeOr(cameraForward, glm::vec3(0.0f, 0.0f, -1.0f));
+		basis.up = normalizeOr(glm::cross(basis.forward, basis.right), glm::vec3(0.0f, 1.0f, 0.0f));
+		return basis;
+	}
+	basis.right = normalizeOr(cam.getXAxis(), glm::vec3(1.0f, 0.0f, 0.0f));
+	basis.up = normalizeOr(cam.getYAxis(), glm::vec3(0.0f, 1.0f, 0.0f));
+	basis.forward = normalizeOr(-cam.getZAxis(), glm::vec3(0.0f, 0.0f, -1.0f));
+	return basis;
+}
+
+void ofApp::drawPtsmProbes() {
+	if(!ptsmGui.enabled || !ptsmGui.showProbe || ptsmEngine.getProbeCount() == 0) {
+		return;
+	}
+
+	const ptsm::ProbeState* probe = ptsmEngine.getProbeState(0);
+	if(probe == nullptr) {
+		return;
+	}
+
+	ofPushStyle();
+	ofNoFill();
+	ofEnableBlendMode(OF_BLENDMODE_ALPHA);
+	if(probe->trail.size() >= 2) {
+		if(ptsmTrailCachedSize != probe->trail.size()) {
+			rebuildPtsmTrailCache(*probe);
+		}
+		const ofPolyline& drawLine = ptsmSmoothedTrailCache.size() >= 2
+			? ptsmSmoothedTrailCache
+			: ptsmTrailCache;
+		ofSetColor(255, 186, 64, static_cast<int>(ptsmTrailAlpha));
+		ofSetLineWidth(1.1f);
+		drawLine.draw();
+	}
+	ofDisableBlendMode();
+
+	if(cameraMode == 0) {
+		ofFill();
+		ofSetColor(255, 238, 170);
+		ofPushMatrix();
+		ofTranslate(ptsmDisplayPosition);
+		ptsmProbeSphere.draw();
+		ofPopMatrix();
+	}
+	ofPopStyle();
+}
+
+void ofApp::sendPtsmMetrics() {
+	if(!ptsmSettings.osc.enabled || !ptsmOscReady || ptsmEngine.getProbeCount() == 0) {
+		return;
+	}
+
+	const ptsm::ProbeMetrics metrics = ptsmEngine.getMetrics(currentListenerBasis());
+	if(!metrics.valid) {
+		return;
+	}
+	ofxOscBundle bundle = ptsm::makeProbeMetricsOscBundle(ptsmSettings.osc.prefix, metrics);
+	ptsmOscSender.sendBundle(bundle);
+}
+
+std::string ofApp::cameraModeLabel() const {
+	return cameraMode == 1 ? "first-person [V]" : "orbit [V]";
 }
 
 void ofApp::addRotationCue() {
@@ -2180,9 +2859,11 @@ void ofApp::drawBounds() const {
 	ofPushStyle();
 	ofNoFill();
 	ofSetColor(255, 44);
-	const float sceneScale = sceneScaleParam.get();
-	const glm::vec3 worldCenter = 0.5f * (worldMin + worldMax) * sceneScale;
-	const glm::vec3 worldSize = (worldMax - worldMin) * sceneScale;
+	glm::vec3 boundsMin(0.0f);
+	glm::vec3 boundsMax(0.0f);
+	getVisibleBounds(boundsMin, boundsMax);
+	const glm::vec3 worldCenter = 0.5f * (boundsMin + boundsMax);
+	const glm::vec3 worldSize = boundsMax - boundsMin;
 	ofDrawBox(worldCenter, worldSize.x, worldSize.y, worldSize.z);
 	ofPopStyle();
 }
@@ -2221,6 +2902,13 @@ void ofApp::drawHud() const {
 			<< "  angle=" << normalizeDegrees(rotationDegrees)
 			<< "  cueWidth=" << rotationCueInfluenceFrames
 			<< "  cueWeight=" << lastRotationCueWeight;
+		text << '\n'
+			<< "ptsm=" << (ptsmGui.enabled ? "on" : "off")
+			<< "  probes=" << ptsmEngine.getProbeCount()
+			<< "  camera=" << cameraModeLabel()
+			<< "  attractors=" << (ptsmField.getFrameCount() > 0 ? ptsmField.getFrame(0).size() : 0)
+			<< "  sigma=" << ptsmSettings.field.sigma
+			<< "  gain=" << ptsmSettings.field.fieldGain;
 	} else {
 		text << statusMessage;
 	}

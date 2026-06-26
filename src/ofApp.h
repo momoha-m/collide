@@ -4,6 +4,7 @@
 #include "ofxGui.h"
 #include "ofxCameraTimeline.h"
 #include "ofxPtsm.h"
+#include "ofxOsc.h"
 #include "loader.h"
 
 #include <array>
@@ -55,6 +56,7 @@ private:
 
 	void setupGui();
 	void setupPointShader();
+	void setupPtsm();
 	std::string resolveDataDirectoryPath() const;
 
 	bool preloadAllFrameData();
@@ -105,8 +107,28 @@ private:
 	std::size_t computeDisplayStride(std::size_t renderParticleCount) const;
 	void updateInitialCameraFocusFromParticles(const std::vector<RenderParticle>& particles);
 	glm::vec3 transformCachedPositionForDisplay(const glm::vec3& position) const;
+	glm::vec3 transformCachedPositionForPtsm(const glm::vec3& position) const;
+	void getVisibleBounds(glm::vec3& boundsMin, glm::vec3& boundsMax) const;
 	void resetCameraView();
 	void constrainCameraDistance();
+	void syncPtsmSettings();
+	void rebuildPtsmFieldIfNeeded();
+	bool buildPtsmFrame(std::size_t frameIndex, std::vector<glm::vec3>& attractors) const;
+	std::vector<glm::vec3> compressPtsmAttractors(const std::vector<glm::vec3>& points, int maxAttractors) const;
+	glm::vec3 randomUnitVector() const;
+	void samplePtsmAuditionSpawn(glm::vec3& position, glm::vec3& velocity) const;
+	void choosePtsmSpawn(glm::vec3& position, glm::vec3& velocity);
+	void spawnPtsmProbe();
+	void lockPtsmSpawn();
+	void clearPtsmProbes();
+	void resetAllState();
+	void updatePtsmDisplayState(double deltaSeconds);
+	void updateCameraFromPtsmProbe();
+	void rebuildPtsmTrailCache(const ptsm::ProbeState& probe);
+	ptsm::ListenerBasis currentListenerBasis() const;
+	void drawPtsmProbes();
+	void sendPtsmMetrics();
+	std::string cameraModeLabel() const;
 	void addRotationCue();
 	void removeNearestRotationCue(double threshold = 8.0);
 	void sortRotationCues();
@@ -171,6 +193,21 @@ private:
 	ofParameter<bool> showBoundsParam;
 	ofParameter<bool> autoRotateParam;
 	ofParameter<bool> showGuiParam;
+	ofParameter<float> ptsmProbeRadiusParam;
+	ofParameter<float> ptsmTrailAlphaParam;
+	ofParameter<int> ptsmTrailSmoothingParam;
+
+	ptsm::Settings ptsmSettings;
+	ptsm::GuiBindings ptsmGui;
+	ptsm::FieldModel ptsmField;
+	ptsm::ProbeParticleEngine ptsmEngine;
+	ofxOscSender ptsmOscSender;
+	glm::vec3 ptsmDisplayPosition = glm::vec3(0.0f);
+	glm::vec3 ptsmDisplayVelocity = glm::vec3(0.0f);
+	ofPolyline ptsmTrailCache;
+	ofPolyline ptsmSmoothedTrailCache;
+	std::size_t ptsmTrailCachedSize = 0;
+	ofSpherePrimitive ptsmProbeSphere;
 
 	glm::vec3 worldMin = glm::vec3(-1.35f, -1.05f, -1.05f);
 	glm::vec3 worldMax = glm::vec3(1.35f, 1.05f, 1.05f);
@@ -197,6 +234,31 @@ private:
 	float lastRotationCueWeight = 0.0f;
 	bool rotationCueEnabled = true;
 	std::string statusMessage;
+	std::size_t ptsmFieldFrameIndex = std::numeric_limits<std::size_t>::max();
+	int ptsmLastSampleCount = -1;
+	float ptsmLastSceneScale = -1.0f;
+	float ptsmLastViewScale = -1.0f;
+	bool ptsmOscReady = false;
+	std::optional<glm::vec3> ptsmCurrentSpawnPosition;
+	std::optional<glm::vec3> ptsmCurrentSpawnVelocity;
+	std::optional<glm::vec3> ptsmLockedSpawnPosition;
+	std::optional<glm::vec3> ptsmLockedSpawnVelocity;
+	int cameraMode = 0;
+	glm::vec3 cameraForward = glm::vec3(0.0f, 0.0f, -1.0f);
+	glm::vec3 cameraRight = glm::vec3(1.0f, 0.0f, 0.0f);
+	glm::vec3 smoothedCameraPosition = glm::vec3(0.0f);
+	glm::vec3 smoothedCameraTarget = glm::vec3(0.0f);
+	bool cameraStateInitialized = false;
+	float firstPersonLookAhead = 0.16f;
+	float firstPersonEyeOffset = 0.012f;
+	float cameraTurnSmoothing = 0.14f;
+	float particleDisplaySmoothing = 0.32f;
+	float cameraPositionSmoothing = 0.2f;
+	float cameraTargetSmoothing = 0.24f;
+	float ptsmProbeRadius = 0.005f;
+	float ptsmTrailAlpha = 140.0f;
+	int ptsmTrailSmoothingSize = 8;
+	int ptsmMaxTrailDrawPoints = 2500;
 	int previousMaxDrawCount = 0;
 	bool previousFullResolution = false;
 	bool previousAutoLod = true;
