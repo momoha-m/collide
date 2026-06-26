@@ -1,3 +1,4 @@
-ofxGui
 ofxCameraTimeline
+ofxGui
+ofxOsc
 ofxPtsm

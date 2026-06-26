@@ -74,9 +74,11 @@ USER_PREPROCESSOR_DEFINITIONS="OF_NO_FMOD=1"
 LIB_FMOD=""
 GCC_PREPROCESSOR_DEFINITIONS=$(inherited) $(USER_PREPROCESSOR_DEFINITIONS)
 
+HDF5_ROOT = /Users/momoha/miniforge3/envs/of-hdf5
 OTHER_CFLAGS = $(OF_CORE_CFLAGS)
-OTHER_LDFLAGS = $(OF_CORE_LIBS) $(OF_CORE_FRAMEWORKS)
-HEADER_SEARCH_PATHS = $(OF_CORE_HEADERS)
+OTHER_LDFLAGS = $(OF_CORE_LIBS) $(OF_CORE_FRAMEWORKS) -L$(HDF5_ROOT)/lib -lhdf5_cpp -lhdf5 -Wl,-rpath,$(HDF5_ROOT)/lib
+HEADER_SEARCH_PATHS = $(OF_CORE_HEADERS) $(HDF5_ROOT)/include
+LIBRARY_SEARCH_PATHS = $(inherited) $(HDF5_ROOT)/lib
 
 //THIS MAKES SURE THE APP BUILDS INSIDE THE BIN FOLDER
 //If you comment this line out the app will be run from DerrivedData and your data/ files won't be accessible unless you uncomment OF_BUNDLE_DATA_FOLDER = 1 above
