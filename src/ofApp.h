@@ -2,6 +2,7 @@
 
 #include "ofMain.h"
 #include "ofxGui.h"
+#include "ofxCameraTimeline.h"
 #include "loader.h"
 
 #include <array>
@@ -43,6 +44,12 @@ private:
 	struct PrefetchedFrameData {
 		std::size_t frameIndex = std::numeric_limits<std::size_t>::max();
 		std::vector<RenderParticle> particles;
+	};
+
+	struct RotationCue {
+		double frame = 0.0;
+		float degrees = 0.0f;
+		float influenceFrames = 120.0f;
 	};
 
 	void setupGui();
@@ -99,6 +106,17 @@ private:
 	glm::vec3 transformCachedPositionForDisplay(const glm::vec3& position) const;
 	void resetCameraView();
 	void constrainCameraDistance();
+	void addRotationCue();
+	void removeNearestRotationCue(double threshold = 8.0);
+	void sortRotationCues();
+	void applyRotationCues(double playbackPosition);
+	void adjustRotationDegrees(float deltaDegrees);
+	bool loadRotationCues(const std::string& path);
+	bool saveRotationCues(const std::string& path) const;
+	static float normalizeDegrees(float degrees);
+	static float shortestAngleDelta(float fromDegrees, float toDegrees);
+	static float mixDegrees(float fromDegrees, float toDegrees, float amount);
+	static float smoothstep(float amount);
 	void drawPointCloud();
 	void drawBounds() const;
 	void drawHud() const;
@@ -113,6 +131,7 @@ private:
 	std::filesystem::path cacheDirectory;
 
 	ofEasyCam cam;
+	ofxCameraTimeline cameraTimeline;
 	ofVboMesh drawMesh;
 	ofShader pointShader;
 	ofTexture frameTexture;
@@ -125,6 +144,7 @@ private:
 	std::optional<PrefetchedFrameData> stagedNextFrameData;
 	std::unordered_map<std::size_t, std::vector<RenderParticle>> ramFrameCache;
 	std::deque<std::size_t> ramFrameCacheOrder;
+	std::vector<RotationCue> rotationCues;
 
 	ofxPanel gui;
 	ofParameterGroup guiParams;
@@ -172,6 +192,9 @@ private:
 	double playbackFramePosition = 0.0;
 	float currentFrameBlend = 0.0f;
 	float rotationDegrees = 0.0f;
+	float rotationCueInfluenceFrames = 120.0f;
+	float lastRotationCueWeight = 0.0f;
+	bool rotationCueEnabled = true;
 	std::string statusMessage;
 	int previousMaxDrawCount = 0;
 	bool previousFullResolution = false;
@@ -182,6 +205,8 @@ private:
 	glm::vec3 displayNormalizationCenter = glm::vec3(0.0f);
 	float displayNormalizationScale = 1.0f;
 	bool displayNormalizationReady = false;
+	const std::string cameraTimelinePath = "camera_path.json";
+	const std::string rotationCuesPath = "rotation_cues.json";
 
 	std::size_t cacheParticleLimit = 2000000;
 	std::size_t maxRamCachedFrames = 24;

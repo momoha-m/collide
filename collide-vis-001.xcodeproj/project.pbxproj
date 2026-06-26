@@ -15,6 +15,10 @@
 			"fileRef": "C8E9B392-4AF3-4A5A-9ED0-A208AC1B02D3",
 			"isa": "PBXBuildFile"
 		},
+		"11D67B91-1283-48D4-9932-D01428418B50": {
+			"fileRef": "62CE7F7A-FDA5-44B9-9092-4F6BBD54C3A5",
+			"isa": "PBXBuildFile"
+		},
 		"1262875B-2D04-44F9-9771-938E2E90C94D": {
 			"children": [
 				"B91AAB9B-EEDF-4B6E-AB94-CE97DC901C75",
@@ -105,6 +109,20 @@
 			"fileRef": "4AAD3327-F71F-4F03-A75B-68287E6EA109",
 			"isa": "PBXBuildFile"
 		},
+		"58D8B591-D106-4437-BB07-B43FA722C2B5": {
+			"fileEncoding": "4",
+			"isa": "PBXFileReference",
+			"lastKnownFileType": "sourcecode.cpp.h",
+			"name": "ofxCameraTimeline.h",
+			"sourceTree": "<group>"
+		},
+		"62CE7F7A-FDA5-44B9-9092-4F6BBD54C3A5": {
+			"fileEncoding": "4",
+			"isa": "PBXFileReference",
+			"lastKnownFileType": "sourcecode.cpp.cpp",
+			"name": "ofxCameraTimeline.cpp",
+			"sourceTree": "<group>"
+		},
 		"4AAD3327-F71F-4F03-A75B-68287E6EA109": {
 			"fileEncoding": "4",
 			"isa": "PBXFileReference",
@@ -190,6 +208,25 @@
 			"path": "ofxGui",
 			"sourceTree": "<group>"
 		},
+		"A5E98336-F6F4-4FD7-A419-42BE0F37FA0B": {
+			"children": [
+				"62CE7F7A-FDA5-44B9-9092-4F6BBD54C3A5",
+				"58D8B591-D106-4437-BB07-B43FA722C2B5"
+			],
+			"isa": "PBXGroup",
+			"name": "src",
+			"path": "src",
+			"sourceTree": "<group>"
+		},
+		"AB376578-7C35-49EF-A2D4-A1C2719B0C01": {
+			"children": [
+				"A5E98336-F6F4-4FD7-A419-42BE0F37FA0B"
+			],
+			"isa": "PBXGroup",
+			"name": "ofxCameraTimeline",
+			"path": "ofxCameraTimeline",
+			"sourceTree": "<group>"
+		},
 		"AD72E30D-3567-4398-A19A-1FAA6AC531FE": {
 			"fileEncoding": "4",
 			"isa": "PBXFileReference",
@@ -227,7 +264,8 @@
 		},
 		"BB4B014C10F69532006C3DED": {
 			"children": [
-				"9F17BE7B-4C66-4845-A96F-90DC2A409C74"
+				"9F17BE7B-4C66-4845-A96F-90DC2A409C74",
+				"AB376578-7C35-49EF-A2D4-A1C2719B0C01"
 			],
 			"isa": "PBXGroup",
 			"name": "addons",
@@ -387,7 +425,8 @@
 				"7F8B6809-1929-48B4-B968-BA596B3BF17B",
 				"88606F2C-CB83-49A0-A26F-31FE35EAE2E4",
 				"C6A65266-E775-4C7D-8DE1-D1E0098730E4",
-				"DC880E75-015B-4854-BBA6-0FFD2A129371"
+				"DC880E75-015B-4854-BBA6-0FFD2A129371",
+				"11D67B91-1283-48D4-9932-D01428418B50"
 			],
 			"isa": "PBXSourcesBuildPhase",
 			"runOnlyForDeploymentPostprocessing": "0"
@@ -443,6 +482,7 @@
 					"$(OF_CORE_HEADERS)",
 					"src",
 					"../../../addons/ofxGui/src",
+					"../../../addons/ofxCameraTimeline/src",
 					"/Users/momoha/miniforge3/envs/of-hdf5/include"
 				],
 				"LD_RUNPATH_SEARCH_PATHS": [
@@ -474,6 +514,7 @@
 					"$(OF_CORE_HEADERS)",
 					"src",
 					"../../../addons/ofxGui/src",
+					"../../../addons/ofxCameraTimeline/src",
 					"/Users/momoha/miniforge3/envs/of-hdf5/include"
 				],
 				"LD_RUNPATH_SEARCH_PATHS": [

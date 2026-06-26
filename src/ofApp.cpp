@@ -96,6 +96,9 @@ void ofApp::setup() {
 	setupPointShader();
 
 	resetCameraView();
+	cameraTimeline.setup(&cam);
+	cameraTimeline.load(cameraTimelinePath);
+	loadRotationCues(rotationCuesPath);
 
 	ofLogNotice() << "[collide-vis] Setup started";
 	dataDirectoryPath = resolveDataDirectoryPath();
@@ -133,9 +136,7 @@ void ofApp::update() {
 		return;
 	}
 
-	constrainCameraDistance();
 	finishNextFramePrefetch();
-	syncDisplaySettings();
 
 	if(autoRotateParam) {
 		rotationDegrees += static_cast<float>(deltaSeconds) * 6.0f;
@@ -145,6 +146,10 @@ void ofApp::update() {
 		updatePlaybackPosition(deltaSeconds);
 	}
 	applyPlaybackPosition(true);
+	applyRotationCues(playbackFramePosition);
+	cameraTimeline.apply(playbackFramePosition);
+	constrainCameraDistance();
+	syncDisplaySettings();
 	prepareAheadFrameTexture();
 }
 
@@ -154,7 +159,7 @@ void ofApp::draw() {
 	if(preloadReady && frameTexture.isAllocated()) {
 		cam.begin();
 		ofPushMatrix();
-		if(autoRotateParam) {
+		if(autoRotateParam || std::abs(rotationDegrees) > 0.0001f) {
 			ofRotateYDeg(rotationDegrees);
 		}
 		if(showBoundsParam) {
@@ -196,8 +201,76 @@ void ofApp::keyPressed(int key) {
 		showGuiParam = !showGuiParam.get();
 		return;
 	}
+	if(key == 'k') {
+		cameraTimeline.addKeyframe(playbackFramePosition);
+		return;
+	}
+	if(key == 'a') {
+		addRotationCue();
+		return;
+	}
+	if(key == 'v') {
+		rotationCueEnabled = !rotationCueEnabled;
+		statusMessage = rotationCueEnabled ? "Rotation cues on" : "Rotation cues off";
+		return;
+	}
+	if(key == 'x') {
+		removeNearestRotationCue();
+		return;
+	}
+	if(key == '-') {
+		adjustRotationDegrees(-5.0f);
+		return;
+	}
+	if(key == '=') {
+		adjustRotationDegrees(5.0f);
+		return;
+	}
+	if(key == 'c') {
+		cameraTimeline.toggleEnabled();
+		return;
+	}
+	if(key == 'm') {
+		cameraTimeline.toggleMode();
+		return;
+	}
+	if(key == '[') {
+		cameraTimeline.addCueInfluenceFrames(-30.0f);
+		rotationCueInfluenceFrames = std::max(1.0f, rotationCueInfluenceFrames - 30.0f);
+		return;
+	}
+	if(key == ']') {
+		cameraTimeline.addCueInfluenceFrames(30.0f);
+		rotationCueInfluenceFrames += 30.0f;
+		return;
+	}
+	if(key == 's') {
+		const bool cameraSaved = cameraTimeline.save(cameraTimelinePath);
+		const bool rotationSaved = saveRotationCues(rotationCuesPath);
+		if(cameraSaved && rotationSaved) {
+			statusMessage = "Saved camera path and rotation cues";
+		} else {
+			statusMessage = "Failed to save camera path or rotation cues";
+		}
+		return;
+	}
+	if(key == 'l') {
+		const bool cameraLoaded = cameraTimeline.load(cameraTimelinePath);
+		const bool rotationLoaded = loadRotationCues(rotationCuesPath);
+		if(cameraLoaded || rotationLoaded) {
+			statusMessage = "Loaded camera path / rotation cues";
+		} else {
+			statusMessage = "Failed to load camera path / rotation cues";
+		}
+		return;
+	}
+	if(key == 'd') {
+		cameraTimeline.removeNearestKeyframe(playbackFramePosition);
+		return;
+	}
 	if(key == 'r') {
 		resetCameraView();
+		cameraTimeline.refreshBaseCamera();
 		return;
 	}
 	if(key == 'f') {
@@ -1796,6 +1869,195 @@ void ofApp::constrainCameraDistance() {
 	cam.setFarClip(kCameraFarClip);
 }
 
+void ofApp::addRotationCue() {
+	RotationCue cue;
+	cue.frame = playbackFramePosition;
+	cue.degrees = normalizeDegrees(rotationDegrees);
+	cue.influenceFrames = rotationCueInfluenceFrames;
+
+	auto insertIt = std::lower_bound(
+		rotationCues.begin(),
+		rotationCues.end(),
+		cue.frame,
+		[](const RotationCue& existing, double frame) {
+			return existing.frame < frame;
+		}
+	);
+	if(insertIt != rotationCues.end() && std::abs(insertIt->frame - cue.frame) <= 0.0001) {
+		*insertIt = cue;
+	} else {
+		rotationCues.insert(insertIt, cue);
+	}
+
+	statusMessage = "Saved rotation cue " + ofToString(cue.degrees, 1) + " deg";
+}
+
+void ofApp::removeNearestRotationCue(double threshold) {
+	if(rotationCues.empty()) {
+		statusMessage = "No rotation cues";
+		return;
+	}
+
+	double bestDistance = std::max(0.0, threshold);
+	int bestIndex = -1;
+	for(std::size_t i = 0; i < rotationCues.size(); ++i) {
+		const double distance = std::abs(rotationCues[i].frame - playbackFramePosition);
+		if(distance <= bestDistance) {
+			bestDistance = distance;
+			bestIndex = static_cast<int>(i);
+		}
+	}
+
+	if(bestIndex < 0) {
+		statusMessage = "No nearby rotation cue";
+		return;
+	}
+
+	const float removedDegrees = rotationCues[static_cast<std::size_t>(bestIndex)].degrees;
+	rotationCues.erase(rotationCues.begin() + bestIndex);
+	statusMessage = "Removed rotation cue " + ofToString(removedDegrees, 1) + " deg";
+}
+
+void ofApp::sortRotationCues() {
+	std::sort(
+		rotationCues.begin(),
+		rotationCues.end(),
+		[](const RotationCue& a, const RotationCue& b) {
+			return a.frame < b.frame;
+		}
+	);
+}
+
+void ofApp::applyRotationCues(double playbackPosition) {
+	lastRotationCueWeight = 0.0f;
+	if(!rotationCueEnabled || rotationCues.empty()) {
+		rotationDegrees = normalizeDegrees(rotationDegrees);
+		return;
+	}
+
+	const RotationCue* strongestCue = nullptr;
+	float strongestWeight = 0.0f;
+	for(const auto& cue : rotationCues) {
+		const float influence = std::max(cue.influenceFrames, 0.001f);
+		const float normalizedDistance = static_cast<float>(std::abs(playbackPosition - cue.frame)) / influence;
+		if(normalizedDistance >= 1.0f) {
+			continue;
+		}
+
+		float weight = 1.0f - normalizedDistance;
+		weight = smoothstep(ofClamp(weight, 0.0f, 1.0f));
+		if(weight > strongestWeight) {
+			strongestWeight = weight;
+			strongestCue = &cue;
+		}
+	}
+
+	if(strongestCue == nullptr) {
+		rotationDegrees = normalizeDegrees(rotationDegrees);
+		return;
+	}
+
+	lastRotationCueWeight = strongestWeight;
+	rotationDegrees = mixDegrees(rotationDegrees, strongestCue->degrees, strongestWeight);
+}
+
+void ofApp::adjustRotationDegrees(float deltaDegrees) {
+	rotationDegrees = normalizeDegrees(rotationDegrees + deltaDegrees);
+	statusMessage = "Rotation angle " + ofToString(rotationDegrees, 1) + " deg";
+}
+
+bool ofApp::loadRotationCues(const std::string& path) {
+	const std::string resolvedPath = ofToDataPath(path, true);
+	if(!ofFile::doesFileExist(resolvedPath)) {
+		return false;
+	}
+
+	ofJson json;
+	try {
+		json = ofLoadJson(resolvedPath);
+	} catch(const std::exception& error) {
+		statusMessage = "Failed to load rotation cues: " + std::string(error.what());
+		return false;
+	}
+
+	if(!json.contains("cues") || !json["cues"].is_array()) {
+		statusMessage = "Rotation cue file has no cues";
+		return false;
+	}
+
+	rotationCueEnabled = json.value("enabled", rotationCueEnabled);
+	rotationCueInfluenceFrames = json.value("influenceFrames", rotationCueInfluenceFrames);
+
+	std::vector<RotationCue> loaded;
+	for(const auto& entry : json["cues"]) {
+		if(!entry.is_object() || !entry.contains("frame") || !entry.contains("degrees")) {
+			continue;
+		}
+
+		RotationCue cue;
+		cue.frame = entry.value("frame", 0.0);
+		cue.degrees = normalizeDegrees(entry.value("degrees", 0.0f));
+		cue.influenceFrames = entry.value("influenceFrames", rotationCueInfluenceFrames);
+		loaded.push_back(cue);
+	}
+
+	rotationCues = std::move(loaded);
+	sortRotationCues();
+	statusMessage = "Loaded " + ofToString(rotationCues.size()) + " rotation cues";
+	return true;
+}
+
+bool ofApp::saveRotationCues(const std::string& path) const {
+	const std::string resolvedPath = ofToDataPath(path, true);
+	ofJson json;
+	json["version"] = 1;
+	json["enabled"] = rotationCueEnabled;
+	json["influenceFrames"] = rotationCueInfluenceFrames;
+	json["cues"] = ofJson::array();
+	for(const auto& cue : rotationCues) {
+		ofJson entry;
+		entry["frame"] = cue.frame;
+		entry["degrees"] = normalizeDegrees(cue.degrees);
+		entry["influenceFrames"] = cue.influenceFrames;
+		json["cues"].push_back(entry);
+	}
+
+	try {
+		ofSavePrettyJson(resolvedPath, json);
+	} catch(const std::exception&) {
+		return false;
+	}
+	return true;
+}
+
+float ofApp::normalizeDegrees(float degrees) {
+	float normalized = std::fmod(degrees, 360.0f);
+	if(normalized < 0.0f) {
+		normalized += 360.0f;
+	}
+	return normalized;
+}
+
+float ofApp::shortestAngleDelta(float fromDegrees, float toDegrees) {
+	float delta = normalizeDegrees(toDegrees) - normalizeDegrees(fromDegrees);
+	if(delta > 180.0f) {
+		delta -= 360.0f;
+	} else if(delta < -180.0f) {
+		delta += 360.0f;
+	}
+	return delta;
+}
+
+float ofApp::mixDegrees(float fromDegrees, float toDegrees, float amount) {
+	const float t = ofClamp(amount, 0.0f, 1.0f);
+	return normalizeDegrees(normalizeDegrees(fromDegrees) + shortestAngleDelta(fromDegrees, toDegrees) * t);
+}
+
+float ofApp::smoothstep(float amount) {
+	const float t = ofClamp(amount, 0.0f, 1.0f);
+	return t * t * (3.0f - 2.0f * t);
+}
+
 void ofApp::drawPointCloud() {
 	if(currentDisplayParticleCount == 0 || !frameTexture.isAllocated()) {
 		return;
@@ -1899,6 +2161,19 @@ void ofApp::drawHud() const {
 			<< "  fullRes=" << (fullResolutionParam ? "on" : "off")
 			<< "  ram=" << ramFrameCache.size() << "/" << maxRamCachedFrames
 			<< "  " << statusMessage;
+		text << '\n'
+			<< "cameraPath=" << (cameraTimeline.isEnabled() ? "on" : "off")
+			<< "  mode=" << cameraTimeline.getModeName()
+			<< "  keys=" << cameraTimeline.size()
+			<< "  cueWidth=" << cameraTimeline.getCueInfluenceFrames()
+			<< "  cueWeight=" << cameraTimeline.getLastCueWeight()
+			<< "  " << cameraTimeline.getStatus();
+		text << '\n'
+			<< "rotationCues=" << (rotationCueEnabled ? "on" : "off")
+			<< "  keys=" << rotationCues.size()
+			<< "  angle=" << normalizeDegrees(rotationDegrees)
+			<< "  cueWidth=" << rotationCueInfluenceFrames
+			<< "  cueWeight=" << lastRotationCueWeight;
 	} else {
 		text << statusMessage;
 	}
