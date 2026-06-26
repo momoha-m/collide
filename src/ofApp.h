@@ -43,6 +43,11 @@ private:
 		float typeIntensity = 0.0f;
 	};
 
+	struct PtsmFlowSample {
+		glm::vec3 position = glm::vec3(0.0f);
+		glm::vec3 velocity = glm::vec3(0.0f);
+	};
+
 	struct PrefetchedFrameData {
 		std::size_t frameIndex = std::numeric_limits<std::size_t>::max();
 		std::vector<RenderParticle> particles;
@@ -115,6 +120,11 @@ private:
 	void rebuildPtsmFieldIfNeeded();
 	bool buildPtsmFrame(std::size_t frameIndex, std::vector<glm::vec3>& attractors) const;
 	std::vector<glm::vec3> compressPtsmAttractors(const std::vector<glm::vec3>& points, int maxAttractors) const;
+	bool buildPtsmFlowFrame(std::size_t frameIndex, std::vector<PtsmFlowSample>& samples) const;
+	std::vector<PtsmFlowSample> compressPtsmFlowSamples(const std::vector<PtsmFlowSample>& samples, int maxSamples) const;
+	glm::vec3 samplePtsmFlowVelocity(const glm::vec3& position) const;
+	glm::vec3 samplePtsmFlowVelocityFromFrame(const std::vector<PtsmFlowSample>& samples, const glm::vec3& position) const;
+	void applyPtsmFlowForces(float dt);
 	glm::vec3 randomUnitVector() const;
 	void samplePtsmAuditionSpawn(glm::vec3& position, glm::vec3& velocity) const;
 	void choosePtsmSpawn(glm::vec3& position, glm::vec3& velocity);
@@ -196,6 +206,10 @@ private:
 	ofParameter<float> ptsmProbeRadiusParam;
 	ofParameter<float> ptsmTrailAlphaParam;
 	ofParameter<int> ptsmTrailSmoothingParam;
+	ofParameter<float> ptsmDensityMixParam;
+	ofParameter<float> ptsmFlowCouplingParam;
+	ofParameter<float> ptsmFlowRadiusParam;
+	ofParameter<float> ptsmFlowVelocityScaleParam;
 
 	ptsm::Settings ptsmSettings;
 	ptsm::GuiBindings ptsmGui;
@@ -208,6 +222,8 @@ private:
 	ofPolyline ptsmSmoothedTrailCache;
 	std::size_t ptsmTrailCachedSize = 0;
 	ofSpherePrimitive ptsmProbeSphere;
+	std::vector<PtsmFlowSample> ptsmFlowSamplesCurrent;
+	std::vector<PtsmFlowSample> ptsmFlowSamplesNext;
 
 	glm::vec3 worldMin = glm::vec3(-1.35f, -1.05f, -1.05f);
 	glm::vec3 worldMax = glm::vec3(1.35f, 1.05f, 1.05f);

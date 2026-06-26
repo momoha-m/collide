@@ -31,6 +31,12 @@ struct VoxelAccumulator {
 	int count = 0;
 };
 
+struct FlowVoxelAccumulator {
+	glm::vec3 positionSum = glm::vec3(0.0f);
+	glm::vec3 velocitySum = glm::vec3(0.0f);
+	int count = 0;
+};
+
 using VoxelKey = std::array<int, 3>;
 
 struct VoxelKeyHash {
@@ -226,11 +232,12 @@ void ofApp::update() {
 				? static_cast<float>(std::abs(playbackDeltaFrames)) / referenceDeltaFrames
 				: 1.0f;
 			if(playbackScale > 0.0f) {
-				ptsmEngine.update(
+				const float ptsmUpdateDt =
 					ptsmSettings.probe.dt *
 					static_cast<float>(std::max(1, ptsmSettings.probe.substeps)) *
-					playbackScale
-				);
+					playbackScale;
+				ptsmEngine.update(ptsmUpdateDt);
+				applyPtsmFlowForces(ptsmUpdateDt);
 				updatePtsmDisplayState(deltaSeconds);
 			}
 		}
@@ -460,7 +467,7 @@ void ofApp::setupGui() {
 	guiParams.add(showGuiParam.set("gui", true));
 	ptsmSettings = ptsm::Settings::paper3D();
 	ptsmSettings.field.sigma = 0.62f;
-	ptsmSettings.field.fieldGain = 85.0f;
+	ptsmSettings.field.fieldGain = 45.0f;
 	ptsmSettings.field.sampleCount = 4000;
 	ptsmSettings.field.normalizeByAttractorCount = true;
 	ptsmSettings.probe.dt = 0.0005f;
@@ -478,6 +485,10 @@ void ofApp::setupGui() {
 	ptsmSettings.osc.enabled = false;
 	ptsmGui.setup(ptsmSettings, "ptsm");
 	guiParams.add(ptsmGui.parameters);
+	guiParams.add(ptsmDensityMixParam.set("ptsm density mix", 0.18f, 0.0f, 1.0f));
+	guiParams.add(ptsmFlowCouplingParam.set("ptsm flow follow", 24.0f, 0.0f, 80.0f));
+	guiParams.add(ptsmFlowRadiusParam.set("ptsm flow radius", 0.72f, 0.05f, 3.0f));
+	guiParams.add(ptsmFlowVelocityScaleParam.set("ptsm flow scale", 95.0f, 0.0f, 300.0f));
 	guiParams.add(ptsmProbeRadiusParam.set("ptsm radius", ptsmProbeRadius, 0.001f, 0.04f));
 	guiParams.add(ptsmTrailAlphaParam.set("ptsm trail alpha", ptsmTrailAlpha, 0.0f, 255.0f));
 	guiParams.add(ptsmTrailSmoothingParam.set("ptsm trail smooth", ptsmTrailSmoothingSize, 0, 20));
@@ -2053,7 +2064,7 @@ void ofApp::syncPtsmSettings() {
 	ptsmGui.applyTo(ptsmSettings);
 	ptsmSettings.field.normalizeByAttractorCount = true;
 	ptsmField.setSigma(ptsmSettings.field.sigma);
-	ptsmField.setFieldGain(ptsmSettings.field.fieldGain);
+	ptsmField.setFieldGain(ptsmSettings.field.fieldGain * ofClamp(ptsmDensityMixParam.get(), 0.0f, 1.0f));
 	ptsmField.setNormalizeByAttractorCount(ptsmSettings.field.normalizeByAttractorCount);
 
 	ptsm::ProbeEngineConfig config;
@@ -2116,9 +2127,12 @@ void ofApp::rebuildPtsmFieldIfNeeded() {
 
 	std::vector<glm::vec3> currentAttractors;
 	std::vector<glm::vec3> nextAttractors;
+	std::vector<PtsmFlowSample> currentFlowSamples;
+	std::vector<PtsmFlowSample> nextFlowSamples;
 	if(!buildPtsmFrame(currentFrameIndex, currentAttractors) || currentAttractors.empty()) {
 		return;
 	}
+	buildPtsmFlowFrame(currentFrameIndex, currentFlowSamples);
 
 	const std::size_t nextFrameIndex = renderFrames.size() > 1
 		? (currentFrameIndex + 1) % renderFrames.size()
@@ -2126,8 +2140,13 @@ void ofApp::rebuildPtsmFieldIfNeeded() {
 	if(!buildPtsmFrame(nextFrameIndex, nextAttractors) || nextAttractors.empty()) {
 		nextAttractors = currentAttractors;
 	}
+	if(!buildPtsmFlowFrame(nextFrameIndex, nextFlowSamples) || nextFlowSamples.empty()) {
+		nextFlowSamples = currentFlowSamples;
+	}
 
 	ptsmField.setFrames({currentAttractors, nextAttractors});
+	ptsmFlowSamplesCurrent = std::move(currentFlowSamples);
+	ptsmFlowSamplesNext = std::move(nextFlowSamples);
 	ptsmEngine.setFramePosition(currentFrameBlend);
 	ptsmFieldFrameIndex = currentFrameIndex;
 	ptsmLastSampleCount = sampleCount;
@@ -2224,6 +2243,180 @@ std::vector<glm::vec3> ofApp::compressPtsmAttractors(const std::vector<glm::vec3
 	}
 
 	return compressed;
+}
+
+bool ofApp::buildPtsmFlowFrame(std::size_t frameIndex, std::vector<PtsmFlowSample>& samples) const {
+	samples.clear();
+	if(frameIndex >= renderFrames.size()) {
+		return false;
+	}
+
+	std::vector<RenderParticle> particles;
+	if(const auto* cached = findRamCachedFrame(frameIndex)) {
+		particles = *cached;
+	} else if(!loadCachedFrameData(frameIndex, &particles)) {
+		return false;
+	}
+
+	const std::size_t nextFrameIndex = renderFrames.size() > 1
+		? (frameIndex + 1) % renderFrames.size()
+		: frameIndex;
+	std::vector<RenderParticle> nextParticles;
+	if(const auto* cached = findRamCachedFrame(nextFrameIndex)) {
+		nextParticles = *cached;
+	} else if(!loadCachedFrameData(nextFrameIndex, &nextParticles)) {
+		return false;
+	}
+
+	std::vector<PtsmFlowSample> candidates;
+	candidates.reserve(particles.size());
+	const std::size_t count = std::min(particles.size(), nextParticles.size());
+	for(std::size_t i = 0; i < count; ++i) {
+		const auto& particle = particles[i];
+		const int type = static_cast<int>(std::floor(particle.typeIntensity + 0.0001f));
+		if(!typeUsedForDisplayNormalization(type) || !particleTypeEnabled(type)) {
+			continue;
+		}
+
+		const glm::vec3 position = transformCachedPositionForPtsm(particle.position);
+		const glm::vec3 nextPosition = transformCachedPositionForPtsm(nextParticles[i].position);
+		const glm::vec3 velocity = nextPosition - position;
+		if(std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z) &&
+		   std::isfinite(velocity.x) && std::isfinite(velocity.y) && std::isfinite(velocity.z)) {
+			candidates.push_back({position, velocity});
+		}
+	}
+
+	samples = compressPtsmFlowSamples(candidates, std::max(1, ptsmGui.sampleCount.get()));
+	return !samples.empty();
+}
+
+std::vector<ofApp::PtsmFlowSample> ofApp::compressPtsmFlowSamples(const std::vector<PtsmFlowSample>& samples, int maxSamples) const {
+	if(samples.empty()) {
+		return {};
+	}
+	if(static_cast<int>(samples.size()) <= maxSamples) {
+		return samples;
+	}
+
+	glm::vec3 srcMin(std::numeric_limits<float>::max());
+	glm::vec3 srcMax(std::numeric_limits<float>::lowest());
+	for(const auto& sample : samples) {
+		srcMin = glm::min(srcMin, sample.position);
+		srcMax = glm::max(srcMax, sample.position);
+	}
+
+	const glm::vec3 srcSize = glm::max(srcMax - srcMin, glm::vec3(std::numeric_limits<float>::epsilon()));
+	int gridResolution = 8;
+	std::vector<PtsmFlowSample> compressed;
+
+	while(true) {
+		std::unordered_map<VoxelKey, FlowVoxelAccumulator, VoxelKeyHash> voxels;
+		voxels.reserve(samples.size() / 2);
+
+		for(const auto& sample : samples) {
+			const glm::vec3 normalized = (sample.position - srcMin) / srcSize;
+			const VoxelKey key = {
+				std::min(gridResolution - 1, std::max(0, static_cast<int>(normalized.x * gridResolution))),
+				std::min(gridResolution - 1, std::max(0, static_cast<int>(normalized.y * gridResolution))),
+				std::min(gridResolution - 1, std::max(0, static_cast<int>(normalized.z * gridResolution)))
+			};
+			auto& voxel = voxels[key];
+			voxel.positionSum += sample.position;
+			voxel.velocitySum += sample.velocity;
+			++voxel.count;
+		}
+
+		compressed.clear();
+		compressed.reserve(voxels.size());
+		for(const auto& entry : voxels) {
+			const FlowVoxelAccumulator& voxel = entry.second;
+			const float count = static_cast<float>(std::max(1, voxel.count));
+			compressed.push_back({
+				voxel.positionSum / count,
+				voxel.velocitySum / count
+			});
+		}
+
+		if(static_cast<int>(compressed.size()) <= maxSamples || gridResolution <= 2) {
+			break;
+		}
+		gridResolution = std::max(2, gridResolution - 1);
+	}
+
+	return compressed;
+}
+
+glm::vec3 ofApp::samplePtsmFlowVelocity(const glm::vec3& position) const {
+	const glm::vec3 currentVelocity = samplePtsmFlowVelocityFromFrame(ptsmFlowSamplesCurrent, position);
+	if(ptsmFlowSamplesNext.empty()) {
+		return currentVelocity;
+	}
+	const glm::vec3 nextVelocity = samplePtsmFlowVelocityFromFrame(ptsmFlowSamplesNext, position);
+	return glm::mix(currentVelocity, nextVelocity, ofClamp(currentFrameBlend, 0.0f, 1.0f));
+}
+
+glm::vec3 ofApp::samplePtsmFlowVelocityFromFrame(const std::vector<PtsmFlowSample>& samples, const glm::vec3& position) const {
+	if(samples.empty()) {
+		return glm::vec3(0.0f);
+	}
+
+	const float radius = std::max(ptsmFlowRadiusParam.get(), std::numeric_limits<float>::epsilon());
+	const float denom = 2.0f * radius * radius;
+	glm::vec3 weightedVelocity(0.0f);
+	float totalWeight = 0.0f;
+	for(const auto& sample : samples) {
+		const glm::vec3 delta = position - sample.position;
+		const float squaredDistance = glm::dot(delta, delta);
+		const float weight = std::exp(-squaredDistance / denom);
+		weightedVelocity += sample.velocity * weight;
+		totalWeight += weight;
+	}
+
+	if(totalWeight <= std::numeric_limits<float>::epsilon()) {
+		return glm::vec3(0.0f);
+	}
+	return weightedVelocity / totalWeight;
+}
+
+void ofApp::applyPtsmFlowForces(float dt) {
+	if(ptsmFlowCouplingParam <= 0.0f || ptsmEngine.getProbeCount() == 0) {
+		return;
+	}
+
+	ptsm::ProbeState* probe = ptsmEngine.getMutableProbeState(0);
+	if(probe == nullptr) {
+		return;
+	}
+
+	const glm::vec3 localFlowVelocity =
+		samplePtsmFlowVelocity(probe->position) *
+		std::max(0.0f, ptsmFlowVelocityScaleParam.get());
+	const glm::vec3 desiredAcceleration =
+		(localFlowVelocity - probe->velocity) *
+		std::max(0.0f, ptsmFlowCouplingParam.get());
+	const float mass = std::max(ptsmSettings.probe.mass, std::numeric_limits<float>::epsilon());
+	glm::vec3 flowForce = desiredAcceleration * mass;
+	if(ptsmSettings.probe.maxForce > 0.0f) {
+		const float forceLength = glm::length(flowForce);
+		if(forceLength > ptsmSettings.probe.maxForce && forceLength > std::numeric_limits<float>::epsilon()) {
+			flowForce *= ptsmSettings.probe.maxForce / forceLength;
+		}
+	}
+
+	const glm::vec3 previousAcceleration = probe->previousAcceleration;
+	const glm::vec3 acceleration = flowForce / mass;
+	probe->velocity += std::max(0.0f, dt) * acceleration;
+	if(ptsmSettings.probe.maxSpeed > 0.0f) {
+		const float speed = glm::length(probe->velocity);
+		if(speed > ptsmSettings.probe.maxSpeed && speed > std::numeric_limits<float>::epsilon()) {
+			probe->velocity *= ptsmSettings.probe.maxSpeed / speed;
+		}
+	}
+	const float safeDt = std::max(dt, std::numeric_limits<float>::epsilon());
+	probe->jerk = glm::length(acceleration - previousAcceleration) / safeDt;
+	probe->previousAcceleration = acceleration;
+	probe->field.force += flowForce;
 }
 
 glm::vec3 ofApp::randomUnitVector() const {
@@ -2907,8 +3100,10 @@ void ofApp::drawHud() const {
 			<< "  probes=" << ptsmEngine.getProbeCount()
 			<< "  camera=" << cameraModeLabel()
 			<< "  attractors=" << (ptsmField.getFrameCount() > 0 ? ptsmField.getFrame(0).size() : 0)
+			<< "  flow=" << ptsmFlowSamplesCurrent.size()
 			<< "  sigma=" << ptsmSettings.field.sigma
-			<< "  gain=" << ptsmSettings.field.fieldGain;
+			<< "  gain=" << ptsmSettings.field.fieldGain
+			<< "  flowFollow=" << ptsmFlowCouplingParam.get();
 	} else {
 		text << statusMessage;
 	}
