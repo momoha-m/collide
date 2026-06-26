@@ -483,6 +483,7 @@
 					"src",
 					"../../../addons/ofxGui/src",
 					"../../../addons/ofxCameraTimeline/src",
+					"../../../addons/ofxPtsm/src",
 					"/Users/momoha/miniforge3/envs/of-hdf5/include"
 				],
 				"LD_RUNPATH_SEARCH_PATHS": [
@@ -515,6 +516,7 @@
 					"src",
 					"../../../addons/ofxGui/src",
 					"../../../addons/ofxCameraTimeline/src",
+					"../../../addons/ofxPtsm/src",
 					"/Users/momoha/miniforge3/envs/of-hdf5/include"
 				],
 				"LD_RUNPATH_SEARCH_PATHS": [

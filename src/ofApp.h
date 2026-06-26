@@ -3,6 +3,7 @@
 #include "ofMain.h"
 #include "ofxGui.h"
 #include "ofxCameraTimeline.h"
+#include "ofxPtsm.h"
 #include "loader.h"
 
 #include <array>
