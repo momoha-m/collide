@@ -210,6 +210,7 @@ private:
 	ofParameter<float> ptsmFlowCouplingParam;
 	ofParameter<float> ptsmFlowRadiusParam;
 	ofParameter<float> ptsmFlowVelocityScaleParam;
+	ofParameter<float> ptsmFlowVerticalMixParam;
 
 	ptsm::Settings ptsmSettings;
 	ptsm::GuiBindings ptsmGui;

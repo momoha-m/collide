@@ -489,6 +489,7 @@ void ofApp::setupGui() {
 	guiParams.add(ptsmFlowCouplingParam.set("ptsm flow follow", 24.0f, 0.0f, 80.0f));
 	guiParams.add(ptsmFlowRadiusParam.set("ptsm flow radius", 0.72f, 0.05f, 3.0f));
 	guiParams.add(ptsmFlowVelocityScaleParam.set("ptsm flow scale", 95.0f, 0.0f, 300.0f));
+	guiParams.add(ptsmFlowVerticalMixParam.set("ptsm flow vertical", 0.42f, 0.0f, 1.0f));
 	guiParams.add(ptsmProbeRadiusParam.set("ptsm radius", ptsmProbeRadius, 0.001f, 0.04f));
 	guiParams.add(ptsmTrailAlphaParam.set("ptsm trail alpha", ptsmTrailAlpha, 0.0f, 255.0f));
 	guiParams.add(ptsmTrailSmoothingParam.set("ptsm trail smooth", ptsmTrailSmoothingSize, 0, 20));
@@ -2271,6 +2272,7 @@ bool ofApp::buildPtsmFlowFrame(std::size_t frameIndex, std::vector<PtsmFlowSampl
 	std::vector<PtsmFlowSample> candidates;
 	candidates.reserve(particles.size());
 	const std::size_t count = std::min(particles.size(), nextParticles.size());
+	glm::vec3 meanVelocity(0.0f);
 	for(std::size_t i = 0; i < count; ++i) {
 		const auto& particle = particles[i];
 		const int type = static_cast<int>(std::floor(particle.typeIntensity + 0.0001f));
@@ -2284,6 +2286,15 @@ bool ofApp::buildPtsmFlowFrame(std::size_t frameIndex, std::vector<PtsmFlowSampl
 		if(std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z) &&
 		   std::isfinite(velocity.x) && std::isfinite(velocity.y) && std::isfinite(velocity.z)) {
 			candidates.push_back({position, velocity});
+			meanVelocity += velocity;
+		}
+	}
+	if(!candidates.empty()) {
+		meanVelocity /= static_cast<float>(candidates.size());
+		const float verticalMix = ofClamp(ptsmFlowVerticalMixParam.get(), 0.0f, 1.0f);
+		for(auto& sample : candidates) {
+			sample.velocity -= meanVelocity;
+			sample.velocity.y *= verticalMix;
 		}
 	}
 
@@ -2438,7 +2449,7 @@ void ofApp::samplePtsmAuditionSpawn(glm::vec3& position, glm::vec3& velocity) co
 	auto launchFromLowerRight = [&](const glm::vec3& target) {
 		position = glm::vec3(
 			boundsMax.x - boundsSize.x * ofRandom(0.06f, 0.16f),
-			boundsMin.y + boundsSize.y * ofRandom(0.22f, 0.38f),
+			boundsMin.y + boundsSize.y * ofRandom(0.42f, 0.62f),
 			boundsMin.z + boundsSize.z * ofRandom(0.34f, 0.66f)
 		);
 		const glm::vec3 primary = glm::normalize(target - position);
