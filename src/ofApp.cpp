@@ -25,6 +25,53 @@ constexpr float kCameraDollyDistance = 0.025f;
 constexpr float kCameraMaxDistance = 80.0f;
 constexpr float kCameraNearClip = 0.0001f;
 constexpr float kCameraFarClip = 10000.0f;
+constexpr float kPtsmMaxPhysicsDt = 1.0f / 60.0f;
+
+bool isFiniteVec3(const glm::vec3& value) {
+	return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+int clampTrailColorPreset(int preset) {
+	return std::clamp(preset, 0, 6);
+}
+
+ofColor trailColorPresetColor(int preset) {
+	switch(clampTrailColorPreset(preset)) {
+		case 1:
+			return ofColor(245, 250, 255);
+		case 2:
+			return ofColor(150, 240, 255);
+		case 3:
+			return ofColor(220, 185, 255);
+		case 4:
+			return ofColor(255, 150, 220);
+		case 5:
+			return ofColor(205, 225, 255);
+		case 6:
+			return ofColor(255, 220, 165);
+		default:
+			return ofColor(255, 255, 255);
+	}
+}
+
+const char* trailColorPresetLabel(int preset) {
+	switch(clampTrailColorPreset(preset)) {
+		case 1:
+			return "star white";
+		case 2:
+			return "ice cyan";
+		case 3:
+			return "pale lavender";
+		case 4:
+			return "rose mist";
+		case 5:
+			return "pearl blue";
+		case 6:
+			return "soft gold";
+		default:
+			return "custom";
+	}
+}
 
 struct VoxelAccumulator {
 	glm::vec3 sum = glm::vec3(0.0f);
@@ -157,6 +204,7 @@ void ofApp::setup() {
 	cameraTimeline.setup(&cam);
 	cameraTimeline.load(cameraTimelinePath);
 	loadRotationCues(rotationCuesPath);
+	loadPtsmSpawnLock(ptsmSpawnLockPath);
 
 	ofLogNotice() << "[collide-vis] Setup started";
 	dataDirectoryPath = resolveDataDirectoryPath();
@@ -232,12 +280,23 @@ void ofApp::update() {
 				? static_cast<float>(std::abs(playbackDeltaFrames)) / referenceDeltaFrames
 				: 1.0f;
 			if(playbackScale > 0.0f) {
-				const float ptsmUpdateDt =
+				const float ptsmPlaybackScale = ofLerp(
+					1.0f,
+					playbackScale,
+					ofClamp(ptsmPlaybackCouplingParam.get(), 0.0f, 1.0f)
+				);
+				const float rawPtsmUpdateDt =
 					ptsmSettings.probe.dt *
 					static_cast<float>(std::max(1, ptsmSettings.probe.substeps)) *
-					playbackScale;
-				ptsmEngine.update(ptsmUpdateDt);
-				applyPtsmFlowForces(ptsmUpdateDt);
+					ptsmPlaybackScale *
+					std::max(0.0f, ptsmTimeScaleParam.get());
+				const float ptsmUpdateDt = std::min(rawPtsmUpdateDt, kPtsmMaxPhysicsDt);
+				if(ptsmConstantSpeedParam) {
+					updatePtsmSteeringPhysics(ptsmUpdateDt);
+				} else {
+					ptsmEngine.update(ptsmUpdateDt);
+					applyPtsmFlowForces(ptsmUpdateDt);
+				}
 				updatePtsmDisplayState(deltaSeconds);
 			}
 		}
@@ -386,13 +445,15 @@ void ofApp::keyPressed(int key) {
 	if(key == 'N') {
 		ptsmCurrentSpawnPosition.reset();
 		ptsmCurrentSpawnVelocity.reset();
-		ptsmLockedSpawnPosition.reset();
-		ptsmLockedSpawnVelocity.reset();
 		spawnPtsmProbe();
 		return;
 	}
 	if(key == 'B') {
 		lockPtsmSpawn();
+		return;
+	}
+	if(key == 'b') {
+		clearPtsmSpawnLock();
 		return;
 	}
 	if(key == 'I') {
@@ -451,6 +512,7 @@ void ofApp::setupGui() {
 	guiParams.add(brightnessParam.set("brightness", 1.45f, 0.1f, 6.0f));
 	guiParams.add(gradientParam.set("gradient", 0.32f, 0.0f, 1.0f));
 	guiParams.add(typeColorParam.set("typeColor", 0.65f, 0.0f, 1.0f));
+	guiParams.add(colorPaletteParam.set("color palette", 1, 0, 4));
 	guiParams.add(maxDrawCountParam.set("drawCap", 300000, 1000, 2000000));
 	guiParams.add(fullResolutionParam.set("fullRes", true));
 	guiParams.add(autoLodParam.set("autoLOD", true));
@@ -473,7 +535,7 @@ void ofApp::setupGui() {
 	ptsmSettings.probe.dt = 0.0005f;
 	ptsmSettings.probe.energyRetention = 0.99945f;
 	ptsmSettings.probe.substeps = 4;
-	ptsmSettings.probe.trailLength = 12000;
+	ptsmSettings.probe.trailLength = 300000;
 	ptsmSettings.probe.boundsEnabled = true;
 	ptsmSettings.probe.boundsMin = glm::vec3(-4.0f);
 	ptsmSettings.probe.boundsMax = glm::vec3(4.0f);
@@ -485,18 +547,37 @@ void ofApp::setupGui() {
 	ptsmSettings.osc.enabled = false;
 	ptsmGui.setup(ptsmSettings, "ptsm");
 	guiParams.add(ptsmGui.parameters);
-	guiParams.add(ptsmDensityMixParam.set("ptsm density mix", 0.18f, 0.0f, 1.0f));
+	guiParams.add(ptsmDensityMixParam.set("ptsm density mix", 0.32f, 0.0f, 1.0f));
 	guiParams.add(ptsmFlowCouplingParam.set("ptsm flow follow", 16.0f, 0.0f, 80.0f));
 	guiParams.add(ptsmFlowRadiusParam.set("ptsm flow radius", 0.38f, 0.05f, 3.0f));
 	guiParams.add(ptsmFlowVelocityScaleParam.set("ptsm flow scale", 130.0f, 0.0f, 300.0f));
 	guiParams.add(ptsmFlowVerticalMixParam.set("ptsm flow vertical", 0.68f, 0.0f, 1.0f));
-	guiParams.add(ptsmTidalGainParam.set("ptsm tidal gain", 22.0f, 0.0f, 120.0f));
+	guiParams.add(ptsmTidalGainParam.set("ptsm tidal gain", 2.0f, 0.0f, 120.0f));
 	guiParams.add(ptsmVorticityGainParam.set("ptsm vortex gain", 18.0f, 0.0f, 120.0f));
-	guiParams.add(ptsmCompressionGainParam.set("ptsm compress gain", 16.0f, 0.0f, 120.0f));
-	guiParams.add(ptsmDispersionGainParam.set("ptsm disperse gain", 9.0f, 0.0f, 120.0f));
-	guiParams.add(ptsmProbeRadiusParam.set("ptsm radius", ptsmProbeRadius, 0.001f, 0.04f));
+	guiParams.add(ptsmCompressionGainParam.set("ptsm compress gain", 0.0f, 0.0f, 120.0f));
+	guiParams.add(ptsmDispersionGainParam.set("ptsm disperse gain", 0.0f, 0.0f, 120.0f));
+	guiParams.add(ptsmConstantSpeedParam.set("ptsm constant speed", true));
+	guiParams.add(ptsmTargetSpeedParam.set("ptsm target speed", 1.0f, 0.05f, 4.0f));
+	guiParams.add(ptsmSpeedHoldParam.set("ptsm speed hold", 12.0f, 0.0f, 40.0f));
+	guiParams.add(ptsmTimeScaleParam.set("ptsm time scale", 1.0f, 0.05f, 3.0f));
+	guiParams.add(ptsmPlaybackCouplingParam.set("ptsm playback sync", 0.0f, 0.0f, 1.0f));
+	guiParams.add(ptsmTurnGainParam.set("ptsm turn gain", 9.0f, 0.0f, 60.0f));
+	guiParams.add(ptsmMaxTurnRateParam.set("ptsm max turn rate", 720.0f, 10.0f, 2160.0f));
+	guiParams.add(ptsmFlowTurnParam.set("ptsm flow turn", 12.0f, 0.0f, 80.0f));
+	guiParams.add(ptsmVortexTurnParam.set("ptsm vortex turn", 10.0f, 0.0f, 80.0f));
+	guiParams.add(ptsmDensityTurnParam.set("ptsm density turn", 12.0f, 0.0f, 80.0f));
+	guiParams.add(ptsmMinSpeedParam.set("ptsm min speed", 0.35f, 0.0f, 4.0f));
+	guiParams.add(ptsmSteeringMaxSpeedParam.set("ptsm max speed", 1.8f, 0.05f, 8.0f));
+	guiParams.add(ptsmSpawnTangentParam.set("ptsm spawn tangent", true));
+	guiParams.add(ptsmDebugSteeringParam.set("ptsm debug steering", false));
+	guiParams.add(ptsmProbeRadiusParam.set("ptsm particle size", ptsmProbeRadius, 0.001f, 0.04f));
 	guiParams.add(ptsmTrailAlphaParam.set("ptsm trail alpha", ptsmTrailAlpha, 0.0f, 255.0f));
+	guiParams.add(ptsmTrailPresetParam.set("ptsm trail preset", 5, 0, 6));
+	guiParams.add(ptsmTrailRedParam.set("ptsm trail red", ptsmTrailColor.r, 0, 255));
+	guiParams.add(ptsmTrailGreenParam.set("ptsm trail green", ptsmTrailColor.g, 0, 255));
+	guiParams.add(ptsmTrailBlueParam.set("ptsm trail blue", ptsmTrailColor.b, 0, 255));
 	guiParams.add(ptsmTrailSmoothingParam.set("ptsm trail smooth", ptsmTrailSmoothingSize, 0, 20));
+	guiParams.add(ptsmTrailLengthParam.set("ptsm trail length", ptsmSettings.probe.trailLength, 12000, 1000000));
 	gui.setup(guiParams);
 	gui.setPosition(18, 18);
 
@@ -524,6 +605,7 @@ void ofApp::setupPointShader() {
 		uniform float frameBlend;
 		uniform float gradientMix;
 		uniform float typeColorMix;
+		uniform int colorPalette;
 		uniform int showGas;
 		uniform int showDarkMatter;
 		uniform int showDisk;
@@ -551,9 +633,26 @@ void ofApp::setupPointShader() {
 		}
 
 		vec3 fastBlueGradient(float typeValue, float intensity, float motion) {
-			vec3 outerBlue = vec3(0.10, 0.30, 0.78);
-			vec3 referenceBlue = vec3(0.22, 0.56, 1.0);
-			vec3 coreBlue = vec3(0.62, 0.86, 1.0);
+			vec3 outerBlue = vec3(0.06, 0.04, 0.26);
+			vec3 referenceBlue = vec3(0.36, 0.12, 0.82);
+			vec3 coreBlue = vec3(0.68, 0.88, 1.00);
+			if(colorPalette == 1) {
+				outerBlue = vec3(0.10, 0.06, 0.34);
+				referenceBlue = vec3(0.42, 0.16, 0.92);
+				coreBlue = vec3(0.78, 0.96, 1.00);
+			} else if(colorPalette == 2) {
+				outerBlue = vec3(0.04, 0.05, 0.30);
+				referenceBlue = vec3(0.22, 0.34, 1.00);
+				coreBlue = vec3(0.54, 1.00, 1.00);
+			} else if(colorPalette == 3) {
+				outerBlue = vec3(0.16, 0.04, 0.24);
+				referenceBlue = vec3(0.74, 0.12, 0.86);
+				coreBlue = vec3(1.00, 0.68, 0.96);
+			} else if(colorPalette == 4) {
+				outerBlue = vec3(0.08, 0.06, 0.30);
+				referenceBlue = vec3(0.46, 0.28, 0.92);
+				coreBlue = vec3(1.00, 0.92, 1.00);
+			}
 			float signal = clamp(intensity * 0.65 + motion * 0.28, 0.0, 1.0);
 			vec3 color = mix(referenceBlue, coreBlue, signal);
 			if(typeValue < 1.5 && typeValue >= 0.5) {
@@ -563,18 +662,60 @@ void ofApp::setupPointShader() {
 		}
 
 		vec3 fastPotentialGradient(float signal) {
-			vec3 cyan = vec3(0.10, 0.95, 1.0);
-			vec3 warm = vec3(1.0, 0.49, 0.10);
+			vec3 cyan = vec3(0.22, 0.78, 1.00);
+			vec3 warm = vec3(1.00, 0.22, 0.82);
+			if(colorPalette == 1) {
+				cyan = vec3(0.28, 0.06, 0.90);
+				warm = vec3(1.00, 0.22, 0.76);
+			} else if(colorPalette == 2) {
+				cyan = vec3(0.10, 0.88, 1.00);
+				warm = vec3(0.78, 0.28, 1.00);
+			} else if(colorPalette == 3) {
+				cyan = vec3(0.48, 0.10, 0.96);
+				warm = vec3(1.00, 0.36, 0.78);
+			} else if(colorPalette == 4) {
+				cyan = vec3(0.52, 0.74, 1.00);
+				warm = vec3(1.00, 0.58, 0.94);
+			}
 			return mix(cyan, warm, clamp(signal, 0.0, 1.0));
 		}
 
 		vec3 fastTypeColor(float typeValue, float intensity) {
-			vec3 gasCold = vec3(0.08, 0.72, 1.00);
-			vec3 gasHot = vec3(1.00, 0.43, 0.10);
-			vec3 darkMatter = vec3(0.20, 0.26, 0.74);
-			vec3 disk = vec3(1.00, 0.70, 0.18);
-			vec3 bulge = vec3(1.00, 0.38, 0.50);
-			vec3 stars = vec3(1.00, 0.93, 0.68);
+			vec3 gasCold = vec3(0.20, 0.86, 1.00);
+			vec3 gasHot = vec3(1.00, 0.18, 0.78);
+			vec3 darkMatter = vec3(0.14, 0.06, 0.38);
+			vec3 disk = vec3(0.70, 0.36, 1.00);
+			vec3 bulge = vec3(1.00, 0.48, 0.92);
+			vec3 stars = vec3(0.88, 0.96, 1.00);
+			if(colorPalette == 1) {
+				gasCold = vec3(0.26, 0.92, 1.00);
+				gasHot = vec3(1.00, 0.22, 0.76);
+				darkMatter = vec3(0.18, 0.08, 0.44);
+				disk = vec3(0.86, 0.42, 1.00);
+				bulge = vec3(1.00, 0.62, 0.92);
+				stars = vec3(0.94, 0.98, 1.00);
+			} else if(colorPalette == 2) {
+				gasCold = vec3(0.12, 0.92, 1.00);
+				gasHot = vec3(0.90, 0.24, 1.00);
+				darkMatter = vec3(0.08, 0.08, 0.42);
+				disk = vec3(0.42, 0.56, 1.00);
+				bulge = vec3(0.78, 0.50, 1.00);
+				stars = vec3(0.88, 1.00, 1.00);
+			} else if(colorPalette == 3) {
+				gasCold = vec3(0.62, 0.22, 1.00);
+				gasHot = vec3(1.00, 0.24, 0.72);
+				darkMatter = vec3(0.20, 0.04, 0.30);
+				disk = vec3(0.94, 0.28, 1.00);
+				bulge = vec3(1.00, 0.56, 0.90);
+				stars = vec3(1.00, 0.90, 1.00);
+			} else if(colorPalette == 4) {
+				gasCold = vec3(0.44, 0.80, 1.00);
+				gasHot = vec3(1.00, 0.42, 0.92);
+				darkMatter = vec3(0.10, 0.08, 0.32);
+				disk = vec3(0.66, 0.54, 1.00);
+				bulge = vec3(1.00, 0.76, 1.00);
+				stars = vec3(1.00, 0.98, 1.00);
+			}
 			if(typeValue < 0.5) return mix(gasCold, gasHot, clamp(intensity, 0.0, 1.0));
 			if(typeValue < 1.5) return darkMatter;
 			if(typeValue < 2.5) return disk;
@@ -650,6 +791,7 @@ void ofApp::setupPointShader() {
 		uniform float densityGain;
 		uniform float gradientMix;
 		uniform float typeColorMix;
+		uniform int colorPalette;
 		uniform int fastFullRes;
 		in float vType;
 		in float vIntensity;
@@ -661,9 +803,26 @@ void ofApp::setupPointShader() {
 		out vec4 fragColor;
 
 		vec3 blueGradient(float typeValue, float intensity, float motion) {
-			vec3 outerBlue = vec3(0.10, 0.30, 0.78);
-			vec3 referenceBlue = vec3(0.22, 0.56, 1.0);
-			vec3 coreBlue = vec3(0.62, 0.86, 1.0);
+			vec3 outerBlue = vec3(0.06, 0.04, 0.26);
+			vec3 referenceBlue = vec3(0.36, 0.12, 0.82);
+			vec3 coreBlue = vec3(0.68, 0.88, 1.00);
+			if(colorPalette == 1) {
+				outerBlue = vec3(0.10, 0.06, 0.34);
+				referenceBlue = vec3(0.42, 0.16, 0.92);
+				coreBlue = vec3(0.78, 0.96, 1.00);
+			} else if(colorPalette == 2) {
+				outerBlue = vec3(0.04, 0.05, 0.30);
+				referenceBlue = vec3(0.22, 0.34, 1.00);
+				coreBlue = vec3(0.54, 1.00, 1.00);
+			} else if(colorPalette == 3) {
+				outerBlue = vec3(0.16, 0.04, 0.24);
+				referenceBlue = vec3(0.74, 0.12, 0.86);
+				coreBlue = vec3(1.00, 0.68, 0.96);
+			} else if(colorPalette == 4) {
+				outerBlue = vec3(0.08, 0.06, 0.30);
+				referenceBlue = vec3(0.46, 0.28, 0.92);
+				coreBlue = vec3(1.00, 0.92, 1.00);
+			}
 			float signal = clamp(intensity * 0.65 + motion * 0.28, 0.0, 1.0);
 			vec3 color = mix(referenceBlue, coreBlue, signal);
 			if(typeValue < 1.5 && typeValue >= 0.5) {
@@ -673,24 +832,79 @@ void ofApp::setupPointShader() {
 		}
 
 		vec3 potentialGradient(float signal) {
-			vec3 cyan = vec3(0.10, 0.95, 1.0);
-			vec3 warm = vec3(1.0, 0.49, 0.10);
+			vec3 cyan = vec3(0.22, 0.78, 1.00);
+			vec3 warm = vec3(1.00, 0.22, 0.82);
+			if(colorPalette == 1) {
+				cyan = vec3(0.28, 0.06, 0.90);
+				warm = vec3(1.00, 0.22, 0.76);
+			} else if(colorPalette == 2) {
+				cyan = vec3(0.10, 0.88, 1.00);
+				warm = vec3(0.78, 0.28, 1.00);
+			} else if(colorPalette == 3) {
+				cyan = vec3(0.48, 0.10, 0.96);
+				warm = vec3(1.00, 0.36, 0.78);
+			} else if(colorPalette == 4) {
+				cyan = vec3(0.52, 0.74, 1.00);
+				warm = vec3(1.00, 0.58, 0.94);
+			}
 			return mix(cyan, warm, smoothstep(0.05, 1.0, signal));
 		}
 
 		vec3 fastPotentialGradient(float signal) {
-			vec3 cyan = vec3(0.10, 0.95, 1.0);
-			vec3 warm = vec3(1.0, 0.49, 0.10);
+			vec3 cyan = vec3(0.22, 0.78, 1.00);
+			vec3 warm = vec3(1.00, 0.22, 0.82);
+			if(colorPalette == 1) {
+				cyan = vec3(0.28, 0.06, 0.90);
+				warm = vec3(1.00, 0.22, 0.76);
+			} else if(colorPalette == 2) {
+				cyan = vec3(0.10, 0.88, 1.00);
+				warm = vec3(0.78, 0.28, 1.00);
+			} else if(colorPalette == 3) {
+				cyan = vec3(0.48, 0.10, 0.96);
+				warm = vec3(1.00, 0.36, 0.78);
+			} else if(colorPalette == 4) {
+				cyan = vec3(0.52, 0.74, 1.00);
+				warm = vec3(1.00, 0.58, 0.94);
+			}
 			return mix(cyan, warm, clamp(signal, 0.0, 1.0));
 		}
 
 		vec3 typeColor(float typeValue, float intensity, float motion) {
-			vec3 gasCold = vec3(0.08, 0.72, 1.00);
-			vec3 gasHot = vec3(1.00, 0.43, 0.10);
-			vec3 darkMatter = vec3(0.20, 0.26, 0.74);
-			vec3 disk = vec3(1.00, 0.70, 0.18);
-			vec3 bulge = vec3(1.00, 0.38, 0.50);
-			vec3 stars = vec3(1.00, 0.93, 0.68);
+			vec3 gasCold = vec3(0.20, 0.86, 1.00);
+			vec3 gasHot = vec3(1.00, 0.18, 0.78);
+			vec3 darkMatter = vec3(0.14, 0.06, 0.38);
+			vec3 disk = vec3(0.70, 0.36, 1.00);
+			vec3 bulge = vec3(1.00, 0.48, 0.92);
+			vec3 stars = vec3(0.88, 0.96, 1.00);
+			if(colorPalette == 1) {
+				gasCold = vec3(0.26, 0.92, 1.00);
+				gasHot = vec3(1.00, 0.22, 0.76);
+				darkMatter = vec3(0.18, 0.08, 0.44);
+				disk = vec3(0.86, 0.42, 1.00);
+				bulge = vec3(1.00, 0.62, 0.92);
+				stars = vec3(0.94, 0.98, 1.00);
+			} else if(colorPalette == 2) {
+				gasCold = vec3(0.12, 0.92, 1.00);
+				gasHot = vec3(0.90, 0.24, 1.00);
+				darkMatter = vec3(0.08, 0.08, 0.42);
+				disk = vec3(0.42, 0.56, 1.00);
+				bulge = vec3(0.78, 0.50, 1.00);
+				stars = vec3(0.88, 1.00, 1.00);
+			} else if(colorPalette == 3) {
+				gasCold = vec3(0.62, 0.22, 1.00);
+				gasHot = vec3(1.00, 0.24, 0.72);
+				darkMatter = vec3(0.20, 0.04, 0.30);
+				disk = vec3(0.94, 0.28, 1.00);
+				bulge = vec3(1.00, 0.56, 0.90);
+				stars = vec3(1.00, 0.90, 1.00);
+			} else if(colorPalette == 4) {
+				gasCold = vec3(0.44, 0.80, 1.00);
+				gasHot = vec3(1.00, 0.42, 0.92);
+				darkMatter = vec3(0.10, 0.08, 0.32);
+				disk = vec3(0.66, 0.54, 1.00);
+				bulge = vec3(1.00, 0.76, 1.00);
+				stars = vec3(1.00, 0.98, 1.00);
+			}
 			if(typeValue < 0.5) {
 				return mix(gasCold, gasHot, smoothstep(0.06, 0.92, max(intensity, motion * 0.55)));
 			}
@@ -702,12 +916,41 @@ void ofApp::setupPointShader() {
 		}
 
 		vec3 fastTypeColor(float typeValue, float intensity) {
-			vec3 gasCold = vec3(0.08, 0.72, 1.00);
-			vec3 gasHot = vec3(1.00, 0.43, 0.10);
-			vec3 darkMatter = vec3(0.20, 0.26, 0.74);
-			vec3 disk = vec3(1.00, 0.70, 0.18);
-			vec3 bulge = vec3(1.00, 0.38, 0.50);
-			vec3 stars = vec3(1.00, 0.93, 0.68);
+			vec3 gasCold = vec3(0.20, 0.86, 1.00);
+			vec3 gasHot = vec3(1.00, 0.18, 0.78);
+			vec3 darkMatter = vec3(0.14, 0.06, 0.38);
+			vec3 disk = vec3(0.70, 0.36, 1.00);
+			vec3 bulge = vec3(1.00, 0.48, 0.92);
+			vec3 stars = vec3(0.88, 0.96, 1.00);
+			if(colorPalette == 1) {
+				gasCold = vec3(0.26, 0.92, 1.00);
+				gasHot = vec3(1.00, 0.22, 0.76);
+				darkMatter = vec3(0.18, 0.08, 0.44);
+				disk = vec3(0.86, 0.42, 1.00);
+				bulge = vec3(1.00, 0.62, 0.92);
+				stars = vec3(0.94, 0.98, 1.00);
+			} else if(colorPalette == 2) {
+				gasCold = vec3(0.12, 0.92, 1.00);
+				gasHot = vec3(0.90, 0.24, 1.00);
+				darkMatter = vec3(0.08, 0.08, 0.42);
+				disk = vec3(0.42, 0.56, 1.00);
+				bulge = vec3(0.78, 0.50, 1.00);
+				stars = vec3(0.88, 1.00, 1.00);
+			} else if(colorPalette == 3) {
+				gasCold = vec3(0.62, 0.22, 1.00);
+				gasHot = vec3(1.00, 0.24, 0.72);
+				darkMatter = vec3(0.20, 0.04, 0.30);
+				disk = vec3(0.94, 0.28, 1.00);
+				bulge = vec3(1.00, 0.56, 0.90);
+				stars = vec3(1.00, 0.90, 1.00);
+			} else if(colorPalette == 4) {
+				gasCold = vec3(0.44, 0.80, 1.00);
+				gasHot = vec3(1.00, 0.42, 0.92);
+				darkMatter = vec3(0.10, 0.08, 0.32);
+				disk = vec3(0.66, 0.54, 1.00);
+				bulge = vec3(1.00, 0.76, 1.00);
+				stars = vec3(1.00, 0.98, 1.00);
+			}
 			if(typeValue < 0.5) return mix(gasCold, gasHot, clamp(intensity, 0.0, 1.0));
 			if(typeValue < 1.5) return darkMatter;
 			if(typeValue < 2.5) return disk;
@@ -2067,6 +2310,7 @@ void ofApp::syncPtsmSettings() {
 	}
 
 	ptsmGui.applyTo(ptsmSettings);
+	ptsmSettings.probe.trailLength = std::max(1, ptsmTrailLengthParam.get());
 	ptsmSettings.field.normalizeByAttractorCount = true;
 	ptsmField.setSigma(ptsmSettings.field.sigma);
 	ptsmField.setFieldGain(ptsmSettings.field.fieldGain * ofClamp(ptsmDensityMixParam.get(), 0.0f, 1.0f));
@@ -2086,15 +2330,31 @@ void ofApp::syncPtsmSettings() {
 
 	const float newProbeRadius = ptsmProbeRadiusParam;
 	const float newTrailAlpha = ptsmTrailAlphaParam;
+	const int trailColorPreset = clampTrailColorPreset(ptsmTrailPresetParam.get());
+	if(trailColorPreset != ptsmTrailPresetParam.get()) {
+		ptsmTrailPresetParam.set(trailColorPreset);
+	}
+	if(trailColorPreset > 0) {
+		const ofColor presetColor = trailColorPresetColor(trailColorPreset);
+		ptsmTrailRedParam.set(static_cast<int>(presetColor.r));
+		ptsmTrailGreenParam.set(static_cast<int>(presetColor.g));
+		ptsmTrailBlueParam.set(static_cast<int>(presetColor.b));
+	}
+	const ofColor newTrailColor(
+		static_cast<int>(ofClamp(ptsmTrailRedParam.get(), 0, 255)),
+		static_cast<int>(ofClamp(ptsmTrailGreenParam.get(), 0, 255)),
+		static_cast<int>(ofClamp(ptsmTrailBlueParam.get(), 0, 255)));
 	const int newTrailSmoothing = ptsmTrailSmoothingParam;
 	if(std::abs(ptsmProbeRadius - newProbeRadius) > 0.000001f) {
 		ptsmProbeRadius = newProbeRadius;
 		ptsmProbeSphere.setRadius(ptsmProbeRadius);
 	}
 	ptsmTrailAlpha = newTrailAlpha;
+	ptsmTrailColor = newTrailColor;
 	if(ptsmTrailSmoothingSize != newTrailSmoothing) {
 		ptsmTrailSmoothingSize = newTrailSmoothing;
 		ptsmTrailCachedSize = 0;
+		ptsmTrailCacheValid = false;
 	}
 
 	if(ptsmSettings.osc.enabled && !ptsmOscReady) {
@@ -2126,8 +2386,6 @@ void ofApp::rebuildPtsmFieldIfNeeded() {
 	if(spawnSettingsChanged) {
 		ptsmCurrentSpawnPosition.reset();
 		ptsmCurrentSpawnVelocity.reset();
-		ptsmLockedSpawnPosition.reset();
-		ptsmLockedSpawnVelocity.reset();
 	}
 
 	std::vector<glm::vec3> currentAttractors;
@@ -2286,6 +2544,7 @@ bool ofApp::buildPtsmFlowFrame(std::size_t frameIndex, std::vector<PtsmFlowSampl
 
 		const glm::vec3 position = transformCachedPositionForPtsm(particle.position);
 		const glm::vec3 nextPosition = transformCachedPositionForPtsm(nextParticles[i].position);
+		// This is an inter-frame displacement for visualization; ptsm flow scale maps it into display motion.
 		const glm::vec3 velocity = nextPosition - position;
 		if(std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z) &&
 		   std::isfinite(velocity.x) && std::isfinite(velocity.y) && std::isfinite(velocity.z)) {
@@ -2447,6 +2706,248 @@ ofApp::GalaxyFieldLocal ofApp::sampleGalaxyFieldFromFrame(
 	return result;
 }
 
+void ofApp::updatePtsmSteeringPhysics(float dt) {
+	if(ptsmEngine.getProbeCount() == 0) {
+		ptsmLastGalaxyField = GalaxyFieldLocal();
+		return;
+	}
+
+	const float stepDt = std::min(std::max(0.0f, dt), kPtsmMaxPhysicsDt);
+	if(stepDt <= std::numeric_limits<float>::epsilon()) {
+		return;
+	}
+
+	const float mass = std::max(ptsmSettings.probe.mass, std::numeric_limits<float>::epsilon());
+	float minSpeed = std::max(0.0f, ptsmMinSpeedParam.get());
+	float maxSpeed = std::max(minSpeed + 0.001f, ptsmSteeringMaxSpeedParam.get());
+	const float targetSpeed = ofClamp(ptsmTargetSpeedParam.get(), minSpeed, maxSpeed);
+	const float speedHoldGain = std::max(0.0f, ptsmSpeedHoldParam.get());
+	const float turnGain = std::max(0.0f, ptsmTurnGainParam.get());
+	const float maxTurnAngle = ofDegToRad(std::max(0.0f, ptsmMaxTurnRateParam.get())) * stepDt;
+	const float fieldScale = std::max(0.0f, ptsmFlowVelocityScaleParam.get());
+	const float maxForce = std::max(0.0f, ptsmSettings.probe.maxForce);
+	bool capturedMetrics = false;
+
+	for(std::size_t probeIndex = 0; probeIndex < ptsmEngine.getProbeCount(); ++probeIndex) {
+		ptsm::ProbeState* probe = ptsmEngine.getMutableProbeState(probeIndex);
+		if(probe == nullptr || !probe->alive) {
+			continue;
+		}
+
+		const glm::vec3 previousPosition = probe->position;
+		const glm::vec3 previousAcceleration = probe->previousAcceleration;
+		ptsm::FieldSample densitySample;
+		if(ptsmField.getFrameCount() > 0) {
+			densitySample = ptsmField.sample(probe->position, static_cast<double>(currentFrameBlend));
+		}
+
+		GalaxyFieldLocal local = sampleGalaxyField(probe->position, probe->velocity);
+		local.valid = local.valid ||
+			densitySample.nearestIndex >= 0 ||
+			glm::dot(densitySample.force, densitySample.force) > std::numeric_limits<float>::epsilon();
+		local.densityForce = isFiniteVec3(densitySample.force) ? densitySample.force : glm::vec3(0.0f);
+		local.scaledFlowVelocity = isFiniteVec3(local.flowVelocity)
+			? local.flowVelocity * fieldScale
+			: glm::vec3(0.0f);
+
+		const float currentSpeed = glm::length(probe->velocity);
+		glm::vec3 fallbackDirection = safeNormalizeOr(
+			ptsmDisplayVelocity,
+			safeNormalizeOr(cameraForward, glm::vec3(1.0f, 0.0f, 0.0f))
+		);
+		const float scaledFlowSpeed = glm::length(local.scaledFlowVelocity);
+		if(scaledFlowSpeed > std::numeric_limits<float>::epsilon()) {
+			fallbackDirection = local.scaledFlowVelocity / scaledFlowSpeed;
+		} else if(glm::dot(local.densityForce, local.densityForce) > std::numeric_limits<float>::epsilon()) {
+			const glm::vec3 axis = safeNormalizeOr(local.vorticity, glm::vec3(0.0f, 1.0f, 0.0f));
+			const glm::vec3 tangent = glm::cross(axis, local.densityForce);
+			fallbackDirection = safeNormalizeOr(tangent, fallbackDirection);
+		}
+
+		const glm::vec3 direction = currentSpeed > std::numeric_limits<float>::epsilon()
+			? probe->velocity / currentSpeed
+			: fallbackDirection;
+		const glm::vec3 slipVector = local.scaledFlowVelocity - probe->velocity;
+		const glm::vec3 slipDirection = safeNormalizeOr(slipVector, direction);
+
+		glm::vec3 densityForce(0.0f);
+		const float densityForceMag = glm::length(local.densityForce);
+		if(densityForceMag > 0.000001f) {
+			const float densityStrength = densityForceMag / (densityForceMag + 0.04f);
+			densityForce =
+				(local.densityForce / densityForceMag) *
+				densityStrength *
+				std::max(0.0f, ptsmDensityTurnParam.get()) *
+				mass;
+		}
+		glm::vec3 flowForce(0.0f);
+		if(scaledFlowSpeed > 0.00001f) {
+			const glm::vec3 flowDirection = local.scaledFlowVelocity / scaledFlowSpeed;
+			const glm::vec3 flowLateral = flowDirection - direction * glm::dot(flowDirection, direction);
+			const float flowStrength = scaledFlowSpeed / (scaledFlowSpeed + std::max(0.05f, targetSpeed));
+			flowForce += flowLateral * flowStrength * std::max(0.0f, ptsmFlowTurnParam.get()) * mass;
+		}
+		// Keep legacy flow-follow available, but only as a lateral steering cue in constant-speed mode.
+		const glm::vec3 flowFollowLateral = slipVector - direction * glm::dot(slipVector, direction);
+		flowForce += flowFollowLateral * (std::max(0.0f, ptsmFlowCouplingParam.get()) * 0.15f) * mass;
+
+		const glm::vec3 scaledVorticity = local.vorticity * fieldScale;
+		const float scaledVorticityMag = glm::length(scaledVorticity);
+		glm::vec3 vortexForce(0.0f);
+		if(scaledVorticityMag > 0.00001f) {
+			const glm::vec3 vortexAxis = scaledVorticity / scaledVorticityMag;
+			const float softenedOmega = scaledVorticityMag / (scaledVorticityMag + 1.0f);
+			vortexForce =
+				glm::cross(vortexAxis, direction) *
+				softenedOmega *
+				std::max(0.0f, ptsmVortexTurnParam.get()) *
+				mass;
+		}
+
+		glm::vec3 tidalAcceleration = (local.gradU * probe->velocity) *
+			fieldScale *
+			std::max(0.0f, ptsmTidalGainParam.get());
+		if(!isFiniteVec3(tidalAcceleration)) {
+			tidalAcceleration = glm::vec3(0.0f);
+		}
+
+		const glm::vec3 compressionAcceleration =
+			slipDirection *
+			local.compression *
+			fieldScale *
+			std::max(0.0f, ptsmCompressionGainParam.get());
+
+		const glm::vec3 stableNoise(
+			std::sin(probe->position.x * 12.9898f + probe->position.y * 78.233f + 0.31f),
+			std::sin(probe->position.y * 37.719f + probe->position.z * 11.135f + 1.17f),
+			std::sin(probe->position.z * 24.357f + probe->position.x * 45.164f + 2.03f)
+		);
+		const glm::vec3 dispersionLateral = stableNoise - direction * glm::dot(stableNoise, direction);
+		const glm::vec3 dispersionDirection = safeNormalizeOr(
+			dispersionLateral,
+			safeNormalizeOr(glm::cross(direction, glm::vec3(0.0f, 1.0f, 0.0f)), glm::vec3(1.0f, 0.0f, 0.0f))
+		);
+		const glm::vec3 dispersionAcceleration =
+			dispersionDirection *
+			local.dispersion *
+			fieldScale *
+			std::max(0.0f, ptsmDispersionGainParam.get());
+
+		glm::vec3 tidalForce = (
+			tidalAcceleration +
+			compressionAcceleration +
+			dispersionAcceleration
+		) * mass + vortexForce;
+		glm::vec3 rawForce = densityForce + flowForce + tidalForce;
+		if(!isFiniteVec3(rawForce)) {
+			rawForce = glm::vec3(0.0f);
+		}
+		if(maxForce > 0.0f) {
+			const float forceLength = glm::length(rawForce);
+			if(forceLength > maxForce && forceLength > std::numeric_limits<float>::epsilon()) {
+				const float forceScale = maxForce / forceLength;
+				densityForce *= forceScale;
+				flowForce *= forceScale;
+				tidalForce *= forceScale;
+				rawForce *= forceScale;
+			}
+		}
+
+		const glm::vec3 parallelForce = direction * glm::dot(rawForce, direction);
+		glm::vec3 lateralForce = rawForce - parallelForce;
+		lateralForce = limitVectorLength(lateralForce, maxForce);
+
+		const glm::vec3 steeringAcceleration = (lateralForce / mass) * turnGain;
+		const float directionSpeed = std::max(currentSpeed, minSpeed);
+		glm::vec3 candidateDirection = safeNormalizeOr(
+			direction * directionSpeed + steeringAcceleration * stepDt,
+			direction
+		);
+		const float requestedTurnAngle = safeAngleBetween(direction, candidateDirection);
+		glm::vec3 newDirection = candidateDirection;
+		if(maxTurnAngle <= std::numeric_limits<float>::epsilon()) {
+			newDirection = direction;
+		} else if(requestedTurnAngle > maxTurnAngle) {
+			const float amount = ofClamp(maxTurnAngle / requestedTurnAngle, 0.0f, 1.0f);
+			newDirection = safeNormalizeOr(glm::mix(direction, candidateDirection, amount), direction);
+		}
+
+		const float speedBlend = speedHoldGain > 0.0f
+			? 1.0f - std::exp(-speedHoldGain * stepDt)
+			: 0.0f;
+		float newSpeed = currentSpeed + (targetSpeed - currentSpeed) * speedBlend;
+		if(!std::isfinite(newSpeed)) {
+			newSpeed = targetSpeed;
+		}
+		newSpeed = ofClamp(newSpeed, minSpeed, maxSpeed);
+		const glm::vec3 propulsionAcceleration =
+			direction * ((newSpeed - currentSpeed) / std::max(stepDt, std::numeric_limits<float>::epsilon()));
+
+		probe->velocity = newDirection * newSpeed;
+		probe->position += probe->velocity * stepDt;
+		if(!isFiniteVec3(probe->velocity)) {
+			probe->velocity = direction * targetSpeed;
+		}
+		if(!isFiniteVec3(probe->position)) {
+			probe->position = previousPosition;
+		}
+
+		applyPtsmProbeBounds(*probe);
+		const float boundedSpeed = glm::length(probe->velocity);
+		if(boundedSpeed > maxSpeed && boundedSpeed > std::numeric_limits<float>::epsilon()) {
+			probe->velocity *= maxSpeed / boundedSpeed;
+		} else if(boundedSpeed < minSpeed) {
+			probe->velocity = safeNormalizeOr(probe->velocity, newDirection) * minSpeed;
+		}
+
+		const glm::vec3 finalAcceleration = steeringAcceleration + propulsionAcceleration;
+		const float safeDt = std::max(stepDt, std::numeric_limits<float>::epsilon());
+		probe->jerk = glm::length(finalAcceleration - previousAcceleration) / safeDt;
+		probe->previousAcceleration = finalAcceleration;
+		probe->field = densitySample;
+		probe->field.force = rawForce;
+		appendPtsmProbeTrail(*probe);
+		probe->curvature = computePtsmProbeCurvature(*probe);
+
+		const float actualTurnAngle = safeAngleBetween(direction, safeNormalizeOr(probe->velocity, newDirection));
+		local.densityForce = densityForce;
+		local.flowForce = flowForce;
+		local.tidalForce = tidalForce;
+		local.rawForce = rawForce;
+		local.parallelForce = parallelForce;
+		local.lateralForce = lateralForce;
+		local.steeringAcceleration = steeringAcceleration;
+		local.propulsionAcceleration = propulsionAcceleration;
+		local.totalForce = rawForce;
+		local.rawForceMag = glm::length(rawForce);
+		local.lateralForceMag = glm::length(lateralForce);
+		local.parallelForceMag = glm::length(parallelForce);
+		local.turnRate = actualTurnAngle / safeDt;
+		local.steeringCurvature = local.turnRate / std::max(glm::length(probe->velocity), std::numeric_limits<float>::epsilon());
+		local.targetSpeed = targetSpeed;
+		local.currentSpeed = glm::length(probe->velocity);
+		local.speedError = targetSpeed - local.currentSpeed;
+		local.slip = glm::length(local.scaledFlowVelocity - probe->velocity);
+		local.flowAlignment = 0.0f;
+		if(scaledFlowSpeed > std::numeric_limits<float>::epsilon() &&
+		   local.currentSpeed > std::numeric_limits<float>::epsilon()) {
+			local.flowAlignment = glm::dot(
+				safeNormalizeOr(probe->velocity, newDirection),
+				local.scaledFlowVelocity / scaledFlowSpeed
+			);
+		}
+
+		if(!capturedMetrics) {
+			ptsmLastGalaxyField = local;
+			capturedMetrics = true;
+		}
+	}
+
+	if(!capturedMetrics) {
+		ptsmLastGalaxyField = GalaxyFieldLocal();
+	}
+}
+
 void ofApp::applyPtsmFlowForces(float dt) {
 	if(ptsmFlowCouplingParam <= 0.0f || ptsmEngine.getProbeCount() == 0) {
 		ptsmLastGalaxyField = GalaxyFieldLocal();
@@ -2467,6 +2968,7 @@ void ofApp::applyPtsmFlowForces(float dt) {
 
 	const float fieldScale = std::max(0.0f, ptsmFlowVelocityScaleParam.get());
 	const glm::vec3 localFlowVelocity = local.flowVelocity * fieldScale;
+	const glm::vec3 densityForce = probe->field.force;
 	const glm::vec3 slipVector = localFlowVelocity - probe->velocity;
 	const glm::vec3 slipDirection = glm::length(slipVector) > std::numeric_limits<float>::epsilon()
 		? glm::normalize(slipVector)
@@ -2519,6 +3021,7 @@ void ofApp::applyPtsmFlowForces(float dt) {
 		}
 	}
 
+	const glm::vec3 previousVelocity = probe->velocity;
 	const glm::vec3 previousAcceleration = probe->previousAcceleration;
 	const glm::vec3 acceleration = totalForce / mass;
 	probe->velocity += std::max(0.0f, dt) * acceleration;
@@ -2532,9 +3035,32 @@ void ofApp::applyPtsmFlowForces(float dt) {
 	probe->jerk = glm::length(acceleration - previousAcceleration) / safeDt;
 	probe->previousAcceleration = acceleration;
 	probe->field.force += totalForce;
+	const glm::vec3 rawForce = densityForce + totalForce;
+	const glm::vec3 finalDirection = safeNormalizeOr(probe->velocity, velocityDirection);
+	const glm::vec3 parallelForce = finalDirection * glm::dot(rawForce, finalDirection);
+	const glm::vec3 lateralForce = rawForce - parallelForce;
+	local.scaledFlowVelocity = localFlowVelocity;
+	local.densityForce = densityForce;
 	local.flowForce = flowForce;
 	local.tidalForce = tidalForce;
+	local.rawForce = rawForce;
+	local.parallelForce = parallelForce;
+	local.lateralForce = lateralForce;
 	local.totalForce = probe->field.force;
+	local.rawForceMag = glm::length(rawForce);
+	local.lateralForceMag = glm::length(lateralForce);
+	local.parallelForceMag = glm::length(parallelForce);
+	local.turnRate = safeAngleBetween(previousVelocity, probe->velocity) / safeDt;
+	local.steeringCurvature = local.turnRate / std::max(glm::length(probe->velocity), std::numeric_limits<float>::epsilon());
+	local.targetSpeed = ptsmTargetSpeedParam.get();
+	local.currentSpeed = glm::length(probe->velocity);
+	local.speedError = local.targetSpeed - local.currentSpeed;
+	local.flowAlignment = 0.0f;
+	const float localFlowSpeed = glm::length(localFlowVelocity);
+	if(localFlowSpeed > std::numeric_limits<float>::epsilon() &&
+	   local.currentSpeed > std::numeric_limits<float>::epsilon()) {
+		local.flowAlignment = glm::dot(finalDirection, localFlowVelocity / localFlowSpeed);
+	}
 	local.slip = glm::length(localFlowVelocity - probe->velocity);
 	ptsmLastGalaxyField = local;
 }
@@ -2557,6 +3083,133 @@ float ofApp::frobeniusNorm(const glm::mat3& matrix) const {
 		}
 	}
 	return std::sqrt(sum);
+}
+
+glm::vec3 ofApp::limitVectorLength(const glm::vec3& value, float maxLength) const {
+	if(!isFiniteVec3(value)) {
+		return glm::vec3(0.0f);
+	}
+	if(maxLength <= 0.0f) {
+		return value;
+	}
+	const float length = glm::length(value);
+	if(length <= maxLength || length <= std::numeric_limits<float>::epsilon()) {
+		return value;
+	}
+	return value * (maxLength / length);
+}
+
+glm::vec3 ofApp::safeNormalizeOr(const glm::vec3& value, const glm::vec3& fallback) const {
+	if(isFiniteVec3(value)) {
+		const float length = glm::length(value);
+		if(length > std::numeric_limits<float>::epsilon()) {
+			return value / length;
+		}
+	}
+	if(isFiniteVec3(fallback)) {
+		const float fallbackLength = glm::length(fallback);
+		if(fallbackLength > std::numeric_limits<float>::epsilon()) {
+			return fallback / fallbackLength;
+		}
+	}
+	return glm::vec3(1.0f, 0.0f, 0.0f);
+}
+
+float ofApp::safeAngleBetween(const glm::vec3& from, const glm::vec3& to) const {
+	const float fromLength = isFiniteVec3(from) ? glm::length(from) : 0.0f;
+	const float toLength = isFiniteVec3(to) ? glm::length(to) : 0.0f;
+	if(fromLength <= std::numeric_limits<float>::epsilon() ||
+	   toLength <= std::numeric_limits<float>::epsilon()) {
+		return 0.0f;
+	}
+	const float dotValue = ofClamp(glm::dot(from, to) / (fromLength * toLength), -1.0f, 1.0f);
+	return std::acos(dotValue);
+}
+
+void ofApp::applyPtsmProbeBounds(ptsm::ProbeState& probe) const {
+	const ptsm::ProbeEngineConfig& config = ptsmEngine.getConfig();
+	if(!config.boundsEnabled) {
+		return;
+	}
+
+	if(probe.position.x < config.boundsMin.x || probe.position.x > config.boundsMax.x) {
+		probe.position.x = ofClamp(probe.position.x, config.boundsMin.x, config.boundsMax.x);
+		probe.velocity.x *= -config.boundaryBounce;
+	}
+	if(probe.position.y < config.boundsMin.y || probe.position.y > config.boundsMax.y) {
+		probe.position.y = ofClamp(probe.position.y, config.boundsMin.y, config.boundsMax.y);
+		probe.velocity.y *= -config.boundaryBounce;
+	}
+	if(probe.position.z < config.boundsMin.z || probe.position.z > config.boundsMax.z) {
+		probe.position.z = ofClamp(probe.position.z, config.boundsMin.z, config.boundsMax.z);
+		probe.velocity.z *= -config.boundaryBounce;
+	}
+}
+
+void ofApp::appendPtsmProbeTrail(ptsm::ProbeState& probe) {
+	const int trailLength = std::max(1, ptsmEngine.getConfig().trailLength);
+	probe.trail.push_back(probe.position);
+	while(static_cast<int>(probe.trail.size()) > trailLength) {
+		probe.trail.pop_front();
+	}
+}
+
+float ofApp::computePtsmProbeCurvature(const ptsm::ProbeState& probe) const {
+	if(probe.trail.size() < 3) {
+		return 0.0f;
+	}
+
+	const glm::vec3& p0 = probe.trail[probe.trail.size() - 3];
+	const glm::vec3& p1 = probe.trail[probe.trail.size() - 2];
+	const glm::vec3& p2 = probe.trail[probe.trail.size() - 1];
+	const glm::vec3 segA = p1 - p0;
+	const glm::vec3 segB = p2 - p1;
+	const float lenA = glm::length(segA);
+	const float lenB = glm::length(segB);
+	if(lenA <= std::numeric_limits<float>::epsilon() ||
+	   lenB <= std::numeric_limits<float>::epsilon()) {
+		return 0.0f;
+	}
+
+	const float arcLength = 0.5f * (lenA + lenB);
+	if(arcLength <= std::numeric_limits<float>::epsilon()) {
+		return 0.0f;
+	}
+	return glm::length((segB / lenB) - (segA / lenA)) / arcLength;
+}
+
+glm::vec3 ofApp::ptsmTangentVelocityForSpawn(const glm::vec3& position, const glm::vec3& fallbackVelocity) const {
+	float minSpeed = std::max(0.0f, ptsmMinSpeedParam.get());
+	float maxSpeed = std::max(minSpeed + 0.001f, ptsmSteeringMaxSpeedParam.get());
+	const float targetSpeed = ofClamp(ptsmTargetSpeedParam.get(), minSpeed, maxSpeed);
+	const glm::vec3 previousDirection = safeNormalizeOr(fallbackVelocity, glm::vec3(1.0f, 0.0f, 0.0f));
+
+	ptsm::FieldSample densitySample;
+	if(ptsmField.getFrameCount() > 0) {
+		densitySample = ptsmField.sample(position, static_cast<double>(currentFrameBlend));
+	}
+	GalaxyFieldLocal local = sampleGalaxyField(position, fallbackVelocity);
+	const glm::vec3 inward = safeNormalizeOr(
+		densitySample.force,
+		safeNormalizeOr(-position, previousDirection)
+	);
+
+	glm::vec3 rotationAxis = safeNormalizeOr(local.vorticity, glm::vec3(0.0f, 1.0f, 0.0f));
+	if(glm::dot(local.vorticity, local.vorticity) <= 0.000001f) {
+		const glm::vec3 flowDirection = safeNormalizeOr(local.flowVelocity, glm::vec3(0.0f));
+		const glm::vec3 inferredAxis = glm::cross(inward, flowDirection);
+		rotationAxis = safeNormalizeOr(inferredAxis, glm::vec3(0.0f, 1.0f, 0.0f));
+	}
+
+	glm::vec3 tangent = glm::cross(rotationAxis, inward);
+	if(glm::dot(tangent, tangent) <= std::numeric_limits<float>::epsilon()) {
+		tangent = glm::cross(glm::vec3(1.0f, 0.0f, 0.0f), inward);
+	}
+	tangent = safeNormalizeOr(tangent, previousDirection);
+	if(glm::dot(tangent, previousDirection) < 0.0f) {
+		tangent *= -1.0f;
+	}
+	return tangent * targetSpeed;
 }
 
 glm::vec3 ofApp::randomUnitVector() const {
@@ -2661,6 +3314,9 @@ void ofApp::choosePtsmSpawn(glm::vec3& position, glm::vec3& velocity) {
 	}
 	if(!ptsmCurrentSpawnPosition.has_value() || !ptsmCurrentSpawnVelocity.has_value()) {
 		samplePtsmAuditionSpawn(position, velocity);
+		if(ptsmConstantSpeedParam && ptsmSpawnTangentParam) {
+			velocity = ptsmTangentVelocityForSpawn(position, velocity);
+		}
 		ptsmCurrentSpawnPosition = position;
 		ptsmCurrentSpawnVelocity = velocity;
 		return;
@@ -2708,13 +3364,17 @@ void ofApp::lockPtsmSpawn() {
 		glm::vec3 position(0.0f);
 		glm::vec3 velocity(0.0f);
 		samplePtsmAuditionSpawn(position, velocity);
+		if(ptsmConstantSpeedParam && ptsmSpawnTangentParam) {
+			velocity = ptsmTangentVelocityForSpawn(position, velocity);
+		}
 		ptsmCurrentSpawnPosition = position;
 		ptsmCurrentSpawnVelocity = velocity;
 	}
 
 	ptsmLockedSpawnPosition = ptsmCurrentSpawnPosition;
 	ptsmLockedSpawnVelocity = ptsmCurrentSpawnVelocity;
-	statusMessage = "Locked PTSM spawn";
+	const bool saved = savePtsmSpawnLock(ptsmSpawnLockPath);
+	statusMessage = saved ? "Locked PTSM spawn" : "Locked PTSM spawn, save failed";
 	ofLogNotice() << "[collide-vis] Locked PTSM spawn at "
 		<< ptsmLockedSpawnPosition->x << ", "
 		<< ptsmLockedSpawnPosition->y << ", "
@@ -2725,12 +3385,104 @@ void ofApp::lockPtsmSpawn() {
 		<< ptsmLockedSpawnVelocity->z;
 }
 
+void ofApp::clearPtsmSpawnLock() {
+	ptsmCurrentSpawnPosition.reset();
+	ptsmCurrentSpawnVelocity.reset();
+	ptsmLockedSpawnPosition.reset();
+	ptsmLockedSpawnVelocity.reset();
+
+	const std::string resolvedPath = ofToDataPath(ptsmSpawnLockPath, true);
+	std::error_code ec;
+	std::filesystem::remove(resolvedPath, ec);
+	statusMessage = ec ? "Failed to clear PTSM spawn lock" : "Cleared PTSM spawn lock";
+}
+
+bool ofApp::loadPtsmSpawnLock(const std::string& path) {
+	const std::string resolvedPath = ofToDataPath(path, true);
+	if(!ofFile::doesFileExist(resolvedPath)) {
+		return false;
+	}
+
+	ofJson json;
+	try {
+		json = ofLoadJson(resolvedPath);
+	} catch(const std::exception& error) {
+		statusMessage = "Failed to load PTSM spawn lock: " + std::string(error.what());
+		return false;
+	}
+
+	if(!json.contains("position") || !json.contains("velocity") ||
+	   !json["position"].is_array() || !json["velocity"].is_array() ||
+	   json["position"].size() < 3 || json["velocity"].size() < 3) {
+		statusMessage = "PTSM spawn lock file is invalid";
+		return false;
+	}
+
+	glm::vec3 position(0.0f);
+	glm::vec3 velocity(0.0f);
+	try {
+		position = glm::vec3(
+			json["position"][0].get<float>(),
+			json["position"][1].get<float>(),
+			json["position"][2].get<float>()
+		);
+		velocity = glm::vec3(
+			json["velocity"][0].get<float>(),
+			json["velocity"][1].get<float>(),
+			json["velocity"][2].get<float>()
+		);
+	} catch(const std::exception& error) {
+		statusMessage = "Failed to parse PTSM spawn lock: " + std::string(error.what());
+		return false;
+	}
+	if(!isFiniteVec3(position) || !isFiniteVec3(velocity)) {
+		statusMessage = "PTSM spawn lock has non-finite values";
+		return false;
+	}
+
+	ptsmLockedSpawnPosition = position;
+	ptsmLockedSpawnVelocity = velocity;
+	ptsmCurrentSpawnPosition = position;
+	ptsmCurrentSpawnVelocity = velocity;
+	statusMessage = "Loaded PTSM spawn lock";
+	return true;
+}
+
+bool ofApp::savePtsmSpawnLock(const std::string& path) const {
+	if(!ptsmLockedSpawnPosition.has_value() || !ptsmLockedSpawnVelocity.has_value()) {
+		return false;
+	}
+
+	const std::string resolvedPath = ofToDataPath(path, true);
+	ofJson json;
+	json["version"] = 1;
+	json["position"] = {
+		ptsmLockedSpawnPosition->x,
+		ptsmLockedSpawnPosition->y,
+		ptsmLockedSpawnPosition->z
+	};
+	json["velocity"] = {
+		ptsmLockedSpawnVelocity->x,
+		ptsmLockedSpawnVelocity->y,
+		ptsmLockedSpawnVelocity->z
+	};
+
+	try {
+		ofSavePrettyJson(resolvedPath, json);
+	} catch(const std::exception&) {
+		return false;
+	}
+	return true;
+}
+
 void ofApp::clearPtsmProbes() {
 	ptsmEngine.clearProbes();
 	ptsmLastGalaxyField = GalaxyFieldLocal();
 	ptsmTrailCache.clear();
 	ptsmSmoothedTrailCache.clear();
 	ptsmTrailCachedSize = 0;
+	ptsmTrailCachedLastPoint = glm::vec3(0.0f);
+	ptsmTrailCacheValid = false;
 	statusMessage = "Cleared PTSM probes";
 }
 
@@ -2745,8 +3497,6 @@ void ofApp::resetAllState() {
 	clearPtsmProbes();
 	ptsmCurrentSpawnPosition.reset();
 	ptsmCurrentSpawnVelocity.reset();
-	ptsmLockedSpawnPosition.reset();
-	ptsmLockedSpawnVelocity.reset();
 	ptsmDisplayPosition = glm::vec3(0.0f);
 	ptsmDisplayVelocity = glm::vec3(0.0f);
 
@@ -2834,19 +3584,27 @@ void ofApp::rebuildPtsmTrailCache(const ptsm::ProbeState& probe) {
 	ptsmSmoothedTrailCache.clear();
 	if(probe.trail.empty()) {
 		ptsmTrailCachedSize = 0;
+		ptsmTrailCacheValid = false;
 		return;
 	}
 
-	const std::size_t stride = std::max<std::size_t>(
-		1,
-		probe.trail.size() / static_cast<std::size_t>(ptsmMaxTrailDrawPoints)
+	const std::size_t trailSize = probe.trail.size();
+	const std::size_t drawCount = std::min<std::size_t>(
+		trailSize,
+		static_cast<std::size_t>(std::max(2, ptsmMaxTrailDrawPoints))
 	);
-	std::size_t index = 0;
-	for(const auto& point : probe.trail) {
-		if(index % stride == 0 || index + 1 == probe.trail.size()) {
-			ptsmTrailCache.addVertex(point);
+	if(drawCount <= 1) {
+		ptsmTrailCache.addVertex(probe.trail.back());
+	} else {
+		const double maxIndex = static_cast<double>(trailSize - 1);
+		for(std::size_t i = 0; i < drawCount; ++i) {
+			const double amount = static_cast<double>(i) / static_cast<double>(drawCount - 1);
+			const std::size_t sourceIndex = std::min<std::size_t>(
+				trailSize - 1,
+				static_cast<std::size_t>(std::round(amount * maxIndex))
+			);
+			ptsmTrailCache.addVertex(probe.trail[sourceIndex]);
 		}
-		++index;
 	}
 
 	if(ptsmTrailSmoothingSize > 0 &&
@@ -2854,6 +3612,8 @@ void ofApp::rebuildPtsmTrailCache(const ptsm::ProbeState& probe) {
 		ptsmSmoothedTrailCache = ptsmTrailCache.getSmoothed(ptsmTrailSmoothingSize, 0.5f);
 	}
 	ptsmTrailCachedSize = probe.trail.size();
+	ptsmTrailCachedLastPoint = probe.trail.back();
+	ptsmTrailCacheValid = true;
 }
 
 ptsm::ListenerBasis ofApp::currentListenerBasis() const {
@@ -2889,26 +3649,54 @@ void ofApp::drawPtsmProbes() {
 	ofNoFill();
 	ofEnableBlendMode(OF_BLENDMODE_ALPHA);
 	if(probe->trail.size() >= 2) {
-		if(ptsmTrailCachedSize != probe->trail.size()) {
+		const glm::vec3 trailLastPoint = probe->trail.back();
+		const bool trailEndpointChanged =
+			glm::distance2(trailLastPoint, ptsmTrailCachedLastPoint) > 0.00000001f;
+		if(!ptsmTrailCacheValid ||
+		   ptsmTrailCachedSize != probe->trail.size() ||
+		   trailEndpointChanged) {
 			rebuildPtsmTrailCache(*probe);
 		}
 		const ofPolyline& drawLine = ptsmSmoothedTrailCache.size() >= 2
 			? ptsmSmoothedTrailCache
 			: ptsmTrailCache;
-		ofSetColor(255, 186, 64, static_cast<int>(ptsmTrailAlpha));
-		ofSetLineWidth(1.1f);
+		const int trailAlpha = static_cast<int>(ofClamp(ptsmTrailAlpha, 0.0f, 255.0f));
+		ofEnableBlendMode(OF_BLENDMODE_ALPHA);
+		ofSetColor(ptsmTrailColor.r, ptsmTrailColor.g, ptsmTrailColor.b, trailAlpha);
+		ofSetLineWidth(1.2f);
 		drawLine.draw();
 	}
-	ofDisableBlendMode();
 
 	if(cameraMode == 0) {
 		ofFill();
-		ofSetColor(255, 238, 170);
+		ofEnableBlendMode(OF_BLENDMODE_ALPHA);
+		ofSetColor(ptsmTrailColor.r, ptsmTrailColor.g, ptsmTrailColor.b, 255);
 		ofPushMatrix();
 		ofTranslate(ptsmDisplayPosition);
 		ptsmProbeSphere.draw();
 		ofPopMatrix();
 	}
+
+	if(ptsmDebugSteeringParam && ptsmLastGalaxyField.valid) {
+		const glm::vec3 origin = probe->position;
+		const auto drawVector = [&](const glm::vec3& vector, const ofColor& color, float scale, float maxLength) {
+			glm::vec3 line = limitVectorLength(vector * scale, maxLength);
+			if(glm::dot(line, line) <= std::numeric_limits<float>::epsilon()) {
+				return;
+			}
+			ofSetColor(color);
+			ofDrawLine(origin, origin + line);
+		};
+
+		ofSetLineWidth(1.6f);
+		drawVector(probe->velocity, ofColor(80, 220, 255, 230), 0.18f, 0.18f);
+		drawVector(ptsmLastGalaxyField.totalForce, ofColor(255, 72, 72, 210), 0.004f, 0.28f);
+		drawVector(ptsmLastGalaxyField.lateralForce, ofColor(70, 255, 130, 220), 0.006f, 0.28f);
+		drawVector(ptsmLastGalaxyField.parallelForce, ofColor(120, 150, 255, 180), 0.006f, 0.22f);
+		drawVector(ptsmLastGalaxyField.scaledFlowVelocity, ofColor(210, 96, 255, 210), 0.04f, 0.24f);
+		drawVector(ptsmLastGalaxyField.vorticity, ofColor(255, 230, 80, 210), 0.16f, 0.16f);
+	}
+	ofDisableBlendMode();
 	ofPopStyle();
 }
 
@@ -2959,12 +3747,37 @@ void ofApp::sendPtsmMetrics() {
 		ptsm::addFloatMessage(bundle, prefix + "/galaxy/vorticityBodyY", vorticityBody.y);
 		ptsm::addFloatMessage(bundle, prefix + "/galaxy/vorticityBodyZ", vorticityBody.z);
 		ptsm::addFloatMessage(bundle, prefix + "/galaxy/shear", ptsmLastGalaxyField.shear);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/rawForceMag", ptsmLastGalaxyField.rawForceMag);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/lateralForceMag", ptsmLastGalaxyField.lateralForceMag);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/parallelForceMag", ptsmLastGalaxyField.parallelForceMag);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/turnRate", ptsmLastGalaxyField.turnRate);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/curvature", ptsmLastGalaxyField.steeringCurvature);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/flowAlignment", ptsmLastGalaxyField.flowAlignment);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/vorticityMag", ptsmLastGalaxyField.vorticityMag);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/speedError", ptsmLastGalaxyField.speedError);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/currentSpeed", ptsmLastGalaxyField.currentSpeed);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/targetSpeed", ptsmLastGalaxyField.targetSpeed);
 	}
 	ptsmOscSender.sendBundle(bundle);
 }
 
 std::string ofApp::cameraModeLabel() const {
 	return cameraMode == 1 ? "first-person [V]" : "orbit [V]";
+}
+
+std::string ofApp::colorPaletteLabel() const {
+	switch(colorPaletteParam.get()) {
+		case 1:
+			return "nebula original";
+		case 2:
+			return "nebula cyan";
+		case 3:
+			return "nebula magenta";
+		case 4:
+			return "nebula pearl";
+		default:
+			return "nebula deep";
+	}
 }
 
 void ofApp::addRotationCue() {
@@ -3206,6 +4019,7 @@ void ofApp::drawPointCloud() {
 	pointShader.setUniform1f("densityGain", densityGain);
 	pointShader.setUniform1f("gradientMix", gradientParam);
 	pointShader.setUniform1f("typeColorMix", typeColorParam);
+	pointShader.setUniform1i("colorPalette", colorPaletteParam);
 	pointShader.setUniform1i("fastFullRes", fullResolutionParam && performanceModeParam ? 1 : 0);
 	pointShader.setUniform1i("performanceMode", performanceModeParam ? 1 : 0);
 	pointShader.setUniform1i("temporalSmooth", temporalSmoothParam ? 1 : 0);
@@ -3260,6 +4074,7 @@ void ofApp::drawHud() const {
 			<< "  mode=" << (performanceModeParam ? "fast" : "quality")
 			<< "  fullRes=" << (fullResolutionParam ? "on" : "off")
 			<< "  ram=" << ramFrameCache.size() << "/" << maxRamCachedFrames
+			<< "  palette=" << colorPaletteLabel()
 			<< "  " << statusMessage;
 		text << '\n'
 			<< "cameraPath=" << (cameraTimeline.isEnabled() ? "on" : "off")
@@ -3282,7 +4097,12 @@ void ofApp::drawHud() const {
 			<< "  flow=" << ptsmFlowSamplesCurrent.size()
 			<< "  sigma=" << ptsmSettings.field.sigma
 			<< "  gain=" << ptsmSettings.field.fieldGain
-			<< "  flowFollow=" << ptsmFlowCouplingParam.get();
+			<< "  flowFollow=" << ptsmFlowCouplingParam.get()
+			<< "  steering=" << (ptsmConstantSpeedParam ? "const" : "legacy")
+			<< "  target=" << ptsmTargetSpeedParam.get()
+			<< "  time=" << ptsmTimeScaleParam.get()
+			<< "  sync=" << ptsmPlaybackCouplingParam.get()
+			<< "  trailColor=" << trailColorPresetLabel(ptsmTrailPresetParam.get());
 		if(ptsmLastGalaxyField.valid) {
 			text << '\n'
 				<< "galaxyField"
@@ -3291,6 +4111,15 @@ void ofApp::drawHud() const {
 				<< "  vort=" << ptsmLastGalaxyField.vorticityMag
 				<< "  shear=" << ptsmLastGalaxyField.shear
 				<< "  disp=" << ptsmLastGalaxyField.dispersion;
+			if(ptsmDebugSteeringParam) {
+				text << '\n'
+					<< "steering"
+					<< "  speed=" << ptsmLastGalaxyField.currentSpeed
+					<< "  err=" << ptsmLastGalaxyField.speedError
+					<< "  turn=" << ptsmLastGalaxyField.turnRate
+					<< "  curv=" << ptsmLastGalaxyField.steeringCurvature
+					<< "  align=" << ptsmLastGalaxyField.flowAlignment;
+			}
 		}
 	} else {
 		text << statusMessage;

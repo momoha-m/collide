@@ -52,8 +52,15 @@ private:
 		glm::vec3 flowVelocity = glm::vec3(0.0f);
 		glm::mat3 gradU = glm::mat3(0.0f);
 		glm::vec3 vorticity = glm::vec3(0.0f);
+		glm::vec3 scaledFlowVelocity = glm::vec3(0.0f);
+		glm::vec3 densityForce = glm::vec3(0.0f);
 		glm::vec3 flowForce = glm::vec3(0.0f);
 		glm::vec3 tidalForce = glm::vec3(0.0f);
+		glm::vec3 rawForce = glm::vec3(0.0f);
+		glm::vec3 lateralForce = glm::vec3(0.0f);
+		glm::vec3 parallelForce = glm::vec3(0.0f);
+		glm::vec3 steeringAcceleration = glm::vec3(0.0f);
+		glm::vec3 propulsionAcceleration = glm::vec3(0.0f);
 		glm::vec3 totalForce = glm::vec3(0.0f);
 		float density = 0.0f;
 		float dispersion = 0.0f;
@@ -62,6 +69,15 @@ private:
 		float shear = 0.0f;
 		float slip = 0.0f;
 		float vorticityMag = 0.0f;
+		float rawForceMag = 0.0f;
+		float lateralForceMag = 0.0f;
+		float parallelForceMag = 0.0f;
+		float turnRate = 0.0f;
+		float steeringCurvature = 0.0f;
+		float flowAlignment = 0.0f;
+		float speedError = 0.0f;
+		float targetSpeed = 0.0f;
+		float currentSpeed = 0.0f;
 		bool valid = false;
 	};
 
@@ -145,14 +161,25 @@ private:
 		const glm::vec3& position,
 		const glm::vec3& probeVelocity
 	) const;
+	void updatePtsmSteeringPhysics(float dt);
 	void applyPtsmFlowForces(float dt);
 	glm::mat3 outerProduct(const glm::vec3& a, const glm::vec3& b) const;
 	float frobeniusNorm(const glm::mat3& matrix) const;
+	glm::vec3 limitVectorLength(const glm::vec3& value, float maxLength) const;
+	glm::vec3 safeNormalizeOr(const glm::vec3& value, const glm::vec3& fallback) const;
+	float safeAngleBetween(const glm::vec3& from, const glm::vec3& to) const;
+	void applyPtsmProbeBounds(ptsm::ProbeState& probe) const;
+	void appendPtsmProbeTrail(ptsm::ProbeState& probe);
+	float computePtsmProbeCurvature(const ptsm::ProbeState& probe) const;
+	glm::vec3 ptsmTangentVelocityForSpawn(const glm::vec3& position, const glm::vec3& fallbackVelocity) const;
 	glm::vec3 randomUnitVector() const;
 	void samplePtsmAuditionSpawn(glm::vec3& position, glm::vec3& velocity) const;
 	void choosePtsmSpawn(glm::vec3& position, glm::vec3& velocity);
 	void spawnPtsmProbe();
 	void lockPtsmSpawn();
+	void clearPtsmSpawnLock();
+	bool loadPtsmSpawnLock(const std::string& path);
+	bool savePtsmSpawnLock(const std::string& path) const;
 	void clearPtsmProbes();
 	void resetAllState();
 	void updatePtsmDisplayState(double deltaSeconds);
@@ -162,6 +189,7 @@ private:
 	void drawPtsmProbes();
 	void sendPtsmMetrics();
 	std::string cameraModeLabel() const;
+	std::string colorPaletteLabel() const;
 	void addRotationCue();
 	void removeNearestRotationCue(double threshold = 8.0);
 	void sortRotationCues();
@@ -212,6 +240,7 @@ private:
 	ofParameter<float> brightnessParam;
 	ofParameter<float> gradientParam;
 	ofParameter<float> typeColorParam;
+	ofParameter<int> colorPaletteParam;
 	ofParameter<int> maxDrawCountParam;
 	ofParameter<bool> fullResolutionParam;
 	ofParameter<bool> autoLodParam;
@@ -228,7 +257,12 @@ private:
 	ofParameter<bool> showGuiParam;
 	ofParameter<float> ptsmProbeRadiusParam;
 	ofParameter<float> ptsmTrailAlphaParam;
+	ofParameter<int> ptsmTrailPresetParam;
+	ofParameter<int> ptsmTrailRedParam;
+	ofParameter<int> ptsmTrailGreenParam;
+	ofParameter<int> ptsmTrailBlueParam;
 	ofParameter<int> ptsmTrailSmoothingParam;
+	ofParameter<int> ptsmTrailLengthParam;
 	ofParameter<float> ptsmDensityMixParam;
 	ofParameter<float> ptsmFlowCouplingParam;
 	ofParameter<float> ptsmFlowRadiusParam;
@@ -238,6 +272,20 @@ private:
 	ofParameter<float> ptsmVorticityGainParam;
 	ofParameter<float> ptsmCompressionGainParam;
 	ofParameter<float> ptsmDispersionGainParam;
+	ofParameter<bool> ptsmConstantSpeedParam;
+	ofParameter<float> ptsmTargetSpeedParam;
+	ofParameter<float> ptsmSpeedHoldParam;
+	ofParameter<float> ptsmTimeScaleParam;
+	ofParameter<float> ptsmPlaybackCouplingParam;
+	ofParameter<float> ptsmTurnGainParam;
+	ofParameter<float> ptsmMaxTurnRateParam;
+	ofParameter<float> ptsmFlowTurnParam;
+	ofParameter<float> ptsmVortexTurnParam;
+	ofParameter<float> ptsmDensityTurnParam;
+	ofParameter<float> ptsmMinSpeedParam;
+	ofParameter<float> ptsmSteeringMaxSpeedParam;
+	ofParameter<bool> ptsmSpawnTangentParam;
+	ofParameter<bool> ptsmDebugSteeringParam;
 
 	ptsm::Settings ptsmSettings;
 	ptsm::GuiBindings ptsmGui;
@@ -249,6 +297,8 @@ private:
 	ofPolyline ptsmTrailCache;
 	ofPolyline ptsmSmoothedTrailCache;
 	std::size_t ptsmTrailCachedSize = 0;
+	glm::vec3 ptsmTrailCachedLastPoint = glm::vec3(0.0f);
+	bool ptsmTrailCacheValid = false;
 	ofSpherePrimitive ptsmProbeSphere;
 	std::vector<PtsmFlowSample> ptsmFlowSamplesCurrent;
 	std::vector<PtsmFlowSample> ptsmFlowSamplesNext;
@@ -302,8 +352,9 @@ private:
 	float cameraTargetSmoothing = 0.24f;
 	float ptsmProbeRadius = 0.005f;
 	float ptsmTrailAlpha = 140.0f;
+	ofColor ptsmTrailColor = ofColor(205, 225, 255);
 	int ptsmTrailSmoothingSize = 8;
-	int ptsmMaxTrailDrawPoints = 2500;
+	int ptsmMaxTrailDrawPoints = 8000;
 	int previousMaxDrawCount = 0;
 	bool previousFullResolution = false;
 	bool previousAutoLod = true;
@@ -315,6 +366,7 @@ private:
 	bool displayNormalizationReady = false;
 	const std::string cameraTimelinePath = "camera_path.json";
 	const std::string rotationCuesPath = "rotation_cues.json";
+	const std::string ptsmSpawnLockPath = "ptsm_locked_spawn.json";
 
 	std::size_t cacheParticleLimit = 2000000;
 	std::size_t maxRamCachedFrames = 24;
