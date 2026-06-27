@@ -26,6 +26,8 @@ constexpr float kCameraMaxDistance = 80.0f;
 constexpr float kCameraNearClip = 0.0001f;
 constexpr float kCameraFarClip = 10000.0f;
 constexpr float kPtsmMaxPhysicsDt = 1.0f / 60.0f;
+const glm::vec3 kDefaultPtsmSpawnPosition(1.0303638f, 0.033966564f, 0.07442793f);
+const glm::vec3 kDefaultPtsmSpawnVelocity(-0.50221425f, -0.3711238f, 0.7810557f);
 
 bool isFiniteVec3(const glm::vec3& value) {
 	return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
@@ -204,7 +206,13 @@ void ofApp::setup() {
 	cameraTimeline.setup(&cam);
 	cameraTimeline.load(cameraTimelinePath);
 	loadRotationCues(rotationCuesPath);
-	loadPtsmSpawnLock(ptsmSpawnLockPath);
+	if(!loadPtsmSpawnLock(ptsmSpawnLockPath)) {
+		ptsmLockedSpawnPosition = kDefaultPtsmSpawnPosition;
+		ptsmLockedSpawnVelocity = kDefaultPtsmSpawnVelocity;
+		ptsmCurrentSpawnPosition = kDefaultPtsmSpawnPosition;
+		ptsmCurrentSpawnVelocity = kDefaultPtsmSpawnVelocity;
+		savePtsmSpawnLock(ptsmSpawnLockPath);
+	}
 
 	ofLogNotice() << "[collide-vis] Setup started";
 	dataDirectoryPath = resolveDataDirectoryPath();
@@ -507,7 +515,7 @@ void ofApp::setupGui() {
 	guiParams.add(pointSizeParam.set("pointSize", 1.0f, 0.6f, 8.0f));
 	guiParams.add(sceneScaleParam.set("sceneScale", 1.0f, 0.3f, 8.0f));
 	guiParams.add(coreScaleParam.set("viewScale", 1.0f, 0.2f, 8.0f));
-	guiParams.add(playbackFpsParam.set("playbackFps", 3.0f, 0.25f, 30.0f));
+	guiParams.add(playbackFpsParam.set("playbackFps", 6.0f, 0.25f, 30.0f));
 	guiParams.add(temporalSmoothParam.set("smoothMotion", true));
 	guiParams.add(brightnessParam.set("brightness", 1.45f, 0.1f, 6.0f));
 	guiParams.add(gradientParam.set("gradient", 0.32f, 0.0f, 1.0f));
@@ -535,7 +543,7 @@ void ofApp::setupGui() {
 	ptsmSettings.probe.dt = 0.0005f;
 	ptsmSettings.probe.energyRetention = 0.99945f;
 	ptsmSettings.probe.substeps = 4;
-	ptsmSettings.probe.trailLength = 300000;
+	ptsmSettings.probe.trailLength = 1000;
 	ptsmSettings.probe.boundsEnabled = true;
 	ptsmSettings.probe.boundsMin = glm::vec3(-4.0f);
 	ptsmSettings.probe.boundsMax = glm::vec3(4.0f);
@@ -547,7 +555,7 @@ void ofApp::setupGui() {
 	ptsmSettings.osc.enabled = false;
 	ptsmGui.setup(ptsmSettings, "ptsm");
 	guiParams.add(ptsmGui.parameters);
-	guiParams.add(ptsmDensityMixParam.set("ptsm density mix", 0.32f, 0.0f, 1.0f));
+	guiParams.add(ptsmDensityMixParam.set("ptsm density mix", 0.6f, 0.0f, 1.0f));
 	guiParams.add(ptsmFlowCouplingParam.set("ptsm flow follow", 16.0f, 0.0f, 80.0f));
 	guiParams.add(ptsmFlowRadiusParam.set("ptsm flow radius", 0.38f, 0.05f, 3.0f));
 	guiParams.add(ptsmFlowVelocityScaleParam.set("ptsm flow scale", 130.0f, 0.0f, 300.0f));
@@ -563,13 +571,14 @@ void ofApp::setupGui() {
 	guiParams.add(ptsmPlaybackCouplingParam.set("ptsm playback sync", 0.0f, 0.0f, 1.0f));
 	guiParams.add(ptsmTurnGainParam.set("ptsm turn gain", 9.0f, 0.0f, 60.0f));
 	guiParams.add(ptsmMaxTurnRateParam.set("ptsm max turn rate", 720.0f, 10.0f, 2160.0f));
-	guiParams.add(ptsmFlowTurnParam.set("ptsm flow turn", 12.0f, 0.0f, 80.0f));
-	guiParams.add(ptsmVortexTurnParam.set("ptsm vortex turn", 10.0f, 0.0f, 80.0f));
-	guiParams.add(ptsmDensityTurnParam.set("ptsm density turn", 12.0f, 0.0f, 80.0f));
+	guiParams.add(ptsmFlowTurnParam.set("ptsm flow turn", 20.0f, 0.0f, 80.0f));
+	guiParams.add(ptsmVortexTurnParam.set("ptsm vortex turn", 20.0f, 0.0f, 80.0f));
+	guiParams.add(ptsmDensityTurnParam.set("ptsm density turn", 20.0f, 0.0f, 80.0f));
 	guiParams.add(ptsmMinSpeedParam.set("ptsm min speed", 0.35f, 0.0f, 4.0f));
 	guiParams.add(ptsmSteeringMaxSpeedParam.set("ptsm max speed", 1.8f, 0.05f, 8.0f));
 	guiParams.add(ptsmSpawnTangentParam.set("ptsm spawn tangent", true));
 	guiParams.add(ptsmDebugSteeringParam.set("ptsm debug steering", false));
+	guiParams.add(ptsmLookAtCenterParam.set("ptsm look center", true));
 	guiParams.add(ptsmProbeRadiusParam.set("ptsm particle size", ptsmProbeRadius, 0.001f, 0.04f));
 	guiParams.add(ptsmTrailAlphaParam.set("ptsm trail alpha", ptsmTrailAlpha, 0.0f, 255.0f));
 	guiParams.add(ptsmTrailPresetParam.set("ptsm trail preset", 5, 0, 6));
@@ -577,7 +586,7 @@ void ofApp::setupGui() {
 	guiParams.add(ptsmTrailGreenParam.set("ptsm trail green", ptsmTrailColor.g, 0, 255));
 	guiParams.add(ptsmTrailBlueParam.set("ptsm trail blue", ptsmTrailColor.b, 0, 255));
 	guiParams.add(ptsmTrailSmoothingParam.set("ptsm trail smooth", ptsmTrailSmoothingSize, 0, 20));
-	guiParams.add(ptsmTrailLengthParam.set("ptsm trail length", ptsmSettings.probe.trailLength, 12000, 1000000));
+	guiParams.add(ptsmTrailLengthParam.set("ptsm trail length", ptsmSettings.probe.trailLength, 100, 10000));
 	gui.setup(guiParams);
 	gui.setPosition(18, 18);
 
@@ -3537,11 +3546,23 @@ void ofApp::updateCameraFromPtsmProbe() {
 		return;
 	}
 
-	const float speedSquared = glm::dot(ptsmDisplayVelocity, ptsmDisplayVelocity);
-	if(speedSquared > std::numeric_limits<float>::epsilon()) {
-		const glm::vec3 desiredForward = glm::normalize(ptsmDisplayVelocity);
+	const auto normalizeOr = [](const glm::vec3& value, const glm::vec3& fallback) {
+		const float length = glm::length(value);
+		return length > std::numeric_limits<float>::epsilon() ? value / length : fallback;
+	};
+	glm::vec3 desiredForward = cameraForward;
+	if(ptsmLookAtCenterParam) {
+		glm::vec3 boundsMin(0.0f);
+		glm::vec3 boundsMax(0.0f);
+		getVisibleBounds(boundsMin, boundsMax);
+		const glm::vec3 simulationCenter = 0.5f * (boundsMin + boundsMax);
+		desiredForward = normalizeOr(simulationCenter - ptsmDisplayPosition, desiredForward);
+	} else {
+		desiredForward = normalizeOr(ptsmDisplayVelocity, desiredForward);
+	}
+	if(glm::dot(desiredForward, desiredForward) > std::numeric_limits<float>::epsilon()) {
 		const float blend = ofClamp(cameraTurnSmoothing, 0.0f, 1.0f);
-		cameraForward = glm::normalize(glm::mix(cameraForward, desiredForward, blend));
+		cameraForward = normalizeOr(glm::mix(cameraForward, desiredForward, blend), desiredForward);
 	}
 
 	const glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
@@ -3762,7 +3783,10 @@ void ofApp::sendPtsmMetrics() {
 }
 
 std::string ofApp::cameraModeLabel() const {
-	return cameraMode == 1 ? "first-person [V]" : "orbit [V]";
+	if(cameraMode == 1) {
+		return ptsmLookAtCenterParam ? "first-person center [V]" : "first-person [V]";
+	}
+	return "orbit [V]";
 }
 
 std::string ofApp::colorPaletteLabel() const {

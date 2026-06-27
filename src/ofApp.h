@@ -286,6 +286,7 @@ private:
 	ofParameter<float> ptsmSteeringMaxSpeedParam;
 	ofParameter<bool> ptsmSpawnTangentParam;
 	ofParameter<bool> ptsmDebugSteeringParam;
+	ofParameter<bool> ptsmLookAtCenterParam;
 
 	ptsm::Settings ptsmSettings;
 	ptsm::GuiBindings ptsmGui;
@@ -350,7 +351,7 @@ private:
 	float particleDisplaySmoothing = 0.32f;
 	float cameraPositionSmoothing = 0.2f;
 	float cameraTargetSmoothing = 0.24f;
-	float ptsmProbeRadius = 0.005f;
+	float ptsmProbeRadius = 0.002f;
 	float ptsmTrailAlpha = 140.0f;
 	ofColor ptsmTrailColor = ofColor(205, 225, 255);
 	int ptsmTrailSmoothingSize = 8;
