@@ -23,7 +23,7 @@ constexpr float kCameraInitialMaxDistance = 3.2f;
 constexpr float kCameraFocusDistanceFactor = 1.35f;
 constexpr float kCameraDollyDistance = 0.025f;
 constexpr float kCameraMaxDistance = 80.0f;
-constexpr float kCameraNearClip = 0.0001f;
+constexpr float kCameraNearClip = 0.005f;
 constexpr float kCameraFarClip = 10000.0f;
 constexpr float kPtsmMaxPhysicsDt = 1.0f / 60.0f;
 const glm::vec3 kDefaultPtsmSpawnPosition(1.0303638f, 0.033966564f, 0.07442793f);
@@ -31,6 +31,26 @@ const glm::vec3 kDefaultPtsmSpawnVelocity(-0.50221425f, -0.3711238f, 0.7810557f)
 
 bool isFiniteVec3(const glm::vec3& value) {
 	return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+ofJson vec3ToJson(const glm::vec3& value) {
+	return ofJson::array({value.x, value.y, value.z});
+}
+
+bool jsonToVec3(const ofJson& json, glm::vec3& value) {
+	if(!json.is_array() || json.size() < 3) {
+		return false;
+	}
+	try {
+		value = glm::vec3(
+			json[0].get<float>(),
+			json[1].get<float>(),
+			json[2].get<float>()
+		);
+	} catch(const std::exception&) {
+		return false;
+	}
+	return isFiniteVec3(value);
 }
 
 int clampTrailColorPreset(int preset) {
@@ -77,23 +97,34 @@ const char* trailColorPresetLabel(int preset) {
 
 struct VoxelAccumulator {
 	glm::vec3 sum = glm::vec3(0.0f);
-	int count = 0;
+	std::size_t count = 0;
 };
 
 struct FlowVoxelAccumulator {
 	glm::vec3 positionSum = glm::vec3(0.0f);
 	glm::vec3 velocitySum = glm::vec3(0.0f);
-	int count = 0;
+	std::size_t count = 0;
 };
 
-using VoxelKey = std::array<int, 3>;
+struct VoxelKey {
+	int x = 0;
+	int y = 0;
+	int z = 0;
+	bool operator==(const VoxelKey& other) const {
+		return x == other.x && y == other.y && z == other.z;
+	}
+};
 
 struct VoxelKeyHash {
 	std::size_t operator()(const VoxelKey& key) const {
-		std::size_t seed = 0;
-		for(int value : key) {
-			seed ^= std::hash<int>{}(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-		}
+		std::size_t seed = 14695981039346656037ull;
+		auto mix = [&seed](int value) {
+			seed ^= static_cast<std::size_t>(value + 0x9e3779b9);
+			seed *= 1099511628211ull;
+		};
+		mix(key.x);
+		mix(key.y);
+		mix(key.z);
 		return seed;
 	}
 };
@@ -155,6 +186,14 @@ float packedTypeIntensityValue(int type, float intensity) {
 	return static_cast<float>(type) + ofClamp(intensity, 0.0f, 1.0f) * 0.5f;
 }
 
+float smoothUnit(float edge0, float edge1, float value) {
+	if(edge1 <= edge0) {
+		return value >= edge1 ? 1.0f : 0.0f;
+	}
+	const float amount = ofClamp((value - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+	return amount * amount * (3.0f - 2.0f * amount);
+}
+
 std::filesystem::path cacheOnlyPath() {
 	if(const char* value = std::getenv("COLLIDE_VIS_CACHE_DIR")) {
 		if(value[0] != '\0') {
@@ -213,8 +252,10 @@ void ofApp::setup() {
 		ptsmCurrentSpawnVelocity = kDefaultPtsmSpawnVelocity;
 		savePtsmSpawnLock(ptsmSpawnLockPath);
 	}
+	loadPtsmCameraWorkPoints(ptsmCameraWorkPointsPath);
 
 	ofLogNotice() << "[collide-vis] Setup started";
+	ofLogNotice() << "[collide-vis] GUI split active: COLLIDE VIS panel left, PTSM panel right";
 	dataDirectoryPath = resolveDataDirectoryPath();
 	ofLogNotice() << "[collide-vis] Dataset path: " << dataDirectoryPath;
 	if(const auto cachePath = cacheOnlyPath(); !cachePath.empty()) {
@@ -257,19 +298,36 @@ void ofApp::update() {
 
 	finishNextFramePrefetch();
 
-	if(autoRotateParam) {
-		rotationDegrees += static_cast<float>(deltaSeconds) * 6.0f;
-	}
-
 	const double previousPlaybackFramePosition = playbackFramePosition;
+	PlaybackStopReason playbackStopReason = PlaybackStopReason::None;
 	if(playing) {
-		updatePlaybackPosition(deltaSeconds);
+		playbackStopReason = updatePlaybackPosition(deltaSeconds);
+	}
+	if(cameraWorkReviewPlaying) {
+		autoRotationDegrees = 0.0f;
+	}
+	if(autoRotateParam && !cameraWorkReviewPlaying) {
+		autoRotationDegrees = normalizeDegrees(
+			autoRotationDegrees + static_cast<float>(deltaSeconds) * autoRotateSpeedParam.get()
+		);
 	}
 	applyPlaybackPosition(true);
 	applyRotationCues(playbackFramePosition);
 	cameraTimeline.apply(playbackFramePosition);
 	constrainCameraDistance();
 	syncDisplaySettings();
+	if(playbackStopReason == PlaybackStopReason::RenderEnd) {
+		completeCameraExport();
+	} else if(playbackStopReason == PlaybackStopReason::CameraWorkEnd) {
+		cameraTimeline.setEnabled(false);
+		if(cameraMode == 0) {
+			cam.enableMouseInput();
+		}
+		statusMessage = "Camera work review stopped at last point frame " + ofToString(playbackFramePosition, 3);
+		if(currentFrameIndex < renderFrames.size()) {
+			statusMessage += " / snapshot " + ofToString(renderFrames[currentFrameIndex].frameNumber);
+		}
+	}
 	prepareAheadFrameTexture();
 	syncPtsmSettings();
 	rebuildPtsmFieldIfNeeded();
@@ -299,28 +357,30 @@ void ofApp::update() {
 					ptsmPlaybackScale *
 					std::max(0.0f, ptsmTimeScaleParam.get());
 				const float ptsmUpdateDt = std::min(rawPtsmUpdateDt, kPtsmMaxPhysicsDt);
-				if(ptsmConstantSpeedParam) {
-					updatePtsmSteeringPhysics(ptsmUpdateDt);
-				} else {
-					ptsmEngine.update(ptsmUpdateDt);
-					applyPtsmFlowForces(ptsmUpdateDt);
-				}
+				updatePtsmSteeringPhysics(ptsmUpdateDt);
 				updatePtsmDisplayState(deltaSeconds);
 			}
 		}
-		updateCameraFromPtsmProbe();
+		if(!cameraWorkReviewPlaying) {
+			updateCameraFromPtsmProbe();
+		}
 		sendPtsmMetrics();
+	}
+	if(playbackStopReason == PlaybackStopReason::CameraWorkEnd) {
+		cameraWorkReviewPlaying = false;
 	}
 }
 
 void ofApp::draw() {
 	ofBackground(0);
+	glClear(GL_DEPTH_BUFFER_BIT);
 
 	if(preloadReady && frameTexture.isAllocated()) {
 		cam.begin();
 		ofPushMatrix();
-		if(cameraMode == 0 && (autoRotateParam || std::abs(rotationDegrees) > 0.0001f)) {
-			ofRotateYDeg(rotationDegrees);
+		const float sceneRotationDegrees = currentSceneRotationDegrees();
+		if(cameraMode == 0 && std::abs(sceneRotationDegrees) > 0.0001f) {
+			ofRotateYDeg(sceneRotationDegrees);
 		}
 		if(showBoundsParam) {
 			drawBounds();
@@ -333,7 +393,9 @@ void ofApp::draw() {
 
 	if(showGuiParam) {
 		ofDisableDepthTest();
+		layoutGuiPanels();
 		gui.draw();
+		ptsmPanel.draw();
 		ofEnableDepthTest();
 	}
 	drawHud();
@@ -346,6 +408,23 @@ void ofApp::exit() {
 void ofApp::keyPressed(int key) {
 	if(key == ' ') {
 		playing = !playing;
+		if(playing) {
+			cameraWorkReviewPlaying = false;
+			playbackCarryFrames = 0.0;
+			autoRotateParam = true;
+			if(!cameraTimeline.empty()) {
+				cameraTimeline.setMode(ofxCameraTimeline::Mode::Timeline);
+				cameraTimeline.setEnabled(true);
+			}
+		} else if(!playing) {
+			cameraWorkReviewPlaying = false;
+			playbackCarryFrames = 0.0;
+			autoRotateParam = false;
+			cameraTimeline.setEnabled(false);
+			if(cameraMode == 0) {
+				cam.enableMouseInput();
+			}
+		}
 		return;
 	}
 	if(key == OF_KEY_RIGHT && preloadReady && !renderFrames.empty()) {
@@ -363,11 +442,23 @@ void ofApp::keyPressed(int key) {
 		return;
 	}
 	if(key == 'k') {
-		cameraTimeline.addKeyframe(playbackFramePosition);
+		addCameraWorkPoint();
 		return;
 	}
 	if(key == 'a') {
-		addRotationCue();
+		addCameraWorkPoint();
+		return;
+	}
+	if(key == 'b') {
+		jumpToCameraWorkMark(0);
+		return;
+	}
+	if(key == ',') {
+		jumpToCameraWorkMark(-1);
+		return;
+	}
+	if(key == '.') {
+		jumpToCameraWorkMark(1);
 		return;
 	}
 	if(key == 'v') {
@@ -408,25 +499,50 @@ void ofApp::keyPressed(int key) {
 	if(key == 's') {
 		const bool cameraSaved = cameraTimeline.save(cameraTimelinePath);
 		const bool rotationSaved = saveRotationCues(rotationCuesPath);
-		if(cameraSaved && rotationSaved) {
-			statusMessage = "Saved camera path and rotation cues";
+		const bool ptsmSaved = savePtsmCameraWorkPoints(ptsmCameraWorkPointsPath);
+		if(cameraSaved && rotationSaved && ptsmSaved) {
+			statusMessage = "Saved camera path, rotation cues, and PTSM points";
 		} else {
-			statusMessage = "Failed to save camera path or rotation cues";
+			statusMessage = "Failed to save camera path, rotation cues, or PTSM points";
 		}
 		return;
 	}
 	if(key == 'l') {
 		const bool cameraLoaded = cameraTimeline.load(cameraTimelinePath);
 		const bool rotationLoaded = loadRotationCues(rotationCuesPath);
-		if(cameraLoaded || rotationLoaded) {
-			statusMessage = "Loaded camera path / rotation cues";
+		const bool ptsmLoaded = loadPtsmCameraWorkPoints(ptsmCameraWorkPointsPath);
+		if(cameraLoaded || rotationLoaded || ptsmLoaded) {
+			statusMessage = "Loaded camera path / rotation cues / PTSM points";
 		} else {
-			statusMessage = "Failed to load camera path / rotation cues";
+			statusMessage = "Failed to load camera path / rotation cues / PTSM points";
 		}
 		return;
 	}
 	if(key == 'd') {
-		cameraTimeline.removeNearestKeyframe(playbackFramePosition);
+		if(jumpToCameraWorkMark(0)) {
+			const bool hasReviewSpan = playbackStopFrame.has_value() &&
+				*playbackStopFrame > playbackFramePosition + 0.0001;
+			if(hasReviewSpan) {
+				playing = true;
+				cameraWorkReviewPlaying = true;
+				playbackCarryFrames = 0.0;
+				autoRotateParam = false;
+				autoRotationDegrees = 0.0f;
+				if(!cameraTimeline.empty()) {
+					cameraTimeline.setMode(ofxCameraTimeline::Mode::Timeline);
+					cameraTimeline.setEnabled(true);
+				}
+				statusMessage = "Reviewing camera work points from frame " +
+					ofToString(playbackFramePosition, 3) +
+					" to " + ofToString(*playbackStopFrame, 3);
+			} else {
+				statusMessage += " / single point";
+			}
+		}
+		return;
+	}
+	if(key == 'D') {
+		removeNearestCameraWorkPoint();
 		return;
 	}
 	if(key == 'r') {
@@ -451,17 +567,11 @@ void ofApp::keyPressed(int key) {
 		return;
 	}
 	if(key == 'N') {
-		ptsmCurrentSpawnPosition.reset();
-		ptsmCurrentSpawnVelocity.reset();
-		spawnPtsmProbe();
+		spawnPtsmProbeFromSavedLock();
 		return;
 	}
 	if(key == 'B') {
 		lockPtsmSpawn();
-		return;
-	}
-	if(key == 'b') {
-		clearPtsmSpawnLock();
 		return;
 	}
 	if(key == 'I') {
@@ -507,15 +617,31 @@ void ofApp::keyPressed(int key) {
 void ofApp::windowResized(int w, int h) {
 	(void)w;
 	(void)h;
-	gui.setPosition(18, 18);
+	layoutGuiPanels();
+}
+
+void ofApp::layoutGuiPanels() {
+	const float margin = 18.0f;
+	const float gap = 48.0f;
+	gui.setPosition(margin, margin);
+
+	float ptsmX = static_cast<float>(ofGetWidth()) - margin - ptsmPanel.getWidth();
+	float ptsmY = margin;
+	const float collideRight = margin + gui.getWidth();
+	if(ptsmX < collideRight + gap) {
+		ptsmX = margin;
+		ptsmY = margin + gui.getHeight() + gap;
+	}
+	ptsmPanel.setPosition(ptsmX, ptsmY);
 }
 
 void ofApp::setupGui() {
-	guiParams.setName("collide-vis");
+	guiParams.setName("COLLIDE VIS");
 	guiParams.add(pointSizeParam.set("pointSize", 1.0f, 0.6f, 8.0f));
 	guiParams.add(sceneScaleParam.set("sceneScale", 1.0f, 0.3f, 8.0f));
 	guiParams.add(coreScaleParam.set("viewScale", 1.0f, 0.2f, 8.0f));
 	guiParams.add(playbackFpsParam.set("playbackFps", 6.0f, 0.25f, 30.0f));
+	guiParams.add(cameraReviewFpsParam.set("reviewFps", 18.0f, 0.25f, 90.0f));
 	guiParams.add(temporalSmoothParam.set("smoothMotion", true));
 	guiParams.add(brightnessParam.set("brightness", 1.45f, 0.1f, 6.0f));
 	guiParams.add(gradientParam.set("gradient", 0.32f, 0.0f, 1.0f));
@@ -528,12 +654,13 @@ void ofApp::setupGui() {
 	guiParams.add(depthParticlesParam.set("depthParticles", true));
 	guiParams.add(performanceModeParam.set("performance", true));
 	guiParams.add(showGasParam.set("gas", true));
-	guiParams.add(showDarkMatterParam.set("darkMatter", false));
+	guiParams.add(showDarkMatterParam.set("darkMatter", true));
 	guiParams.add(showDiskParam.set("disk", true));
 	guiParams.add(showBulgeParam.set("bulge", true));
 	guiParams.add(showStarsParam.set("stars", true));
 	guiParams.add(showBoundsParam.set("bounds", false));
 	guiParams.add(autoRotateParam.set("autoRotate", false));
+	guiParams.add(autoRotateSpeedParam.set("autoRotateSpeed", 4.0f, -30.0f, 30.0f));
 	guiParams.add(showGuiParam.set("gui", true));
 	ptsmSettings = ptsm::Settings::paper3D();
 	ptsmSettings.field.sigma = 0.62f;
@@ -554,41 +681,63 @@ void ofApp::setupGui() {
 	ptsmSettings.injection.energyRatio = 0.94f;
 	ptsmSettings.osc.enabled = false;
 	ptsmGui.setup(ptsmSettings, "ptsm");
-	guiParams.add(ptsmGui.parameters);
-	guiParams.add(ptsmDensityMixParam.set("ptsm density mix", 0.6f, 0.0f, 1.0f));
-	guiParams.add(ptsmFlowCouplingParam.set("ptsm flow follow", 16.0f, 0.0f, 80.0f));
-	guiParams.add(ptsmFlowRadiusParam.set("ptsm flow radius", 0.38f, 0.05f, 3.0f));
-	guiParams.add(ptsmFlowVelocityScaleParam.set("ptsm flow scale", 130.0f, 0.0f, 300.0f));
-	guiParams.add(ptsmFlowVerticalMixParam.set("ptsm flow vertical", 0.68f, 0.0f, 1.0f));
-	guiParams.add(ptsmTidalGainParam.set("ptsm tidal gain", 2.0f, 0.0f, 120.0f));
-	guiParams.add(ptsmVorticityGainParam.set("ptsm vortex gain", 18.0f, 0.0f, 120.0f));
-	guiParams.add(ptsmCompressionGainParam.set("ptsm compress gain", 0.0f, 0.0f, 120.0f));
-	guiParams.add(ptsmDispersionGainParam.set("ptsm disperse gain", 0.0f, 0.0f, 120.0f));
-	guiParams.add(ptsmConstantSpeedParam.set("ptsm constant speed", true));
-	guiParams.add(ptsmTargetSpeedParam.set("ptsm target speed", 1.0f, 0.05f, 4.0f));
-	guiParams.add(ptsmSpeedHoldParam.set("ptsm speed hold", 12.0f, 0.0f, 40.0f));
-	guiParams.add(ptsmTimeScaleParam.set("ptsm time scale", 1.0f, 0.05f, 3.0f));
-	guiParams.add(ptsmPlaybackCouplingParam.set("ptsm playback sync", 0.0f, 0.0f, 1.0f));
-	guiParams.add(ptsmTurnGainParam.set("ptsm turn gain", 9.0f, 0.0f, 60.0f));
-	guiParams.add(ptsmMaxTurnRateParam.set("ptsm max turn rate", 720.0f, 10.0f, 2160.0f));
-	guiParams.add(ptsmFlowTurnParam.set("ptsm flow turn", 20.0f, 0.0f, 80.0f));
-	guiParams.add(ptsmVortexTurnParam.set("ptsm vortex turn", 20.0f, 0.0f, 80.0f));
-	guiParams.add(ptsmDensityTurnParam.set("ptsm density turn", 20.0f, 0.0f, 80.0f));
-	guiParams.add(ptsmMinSpeedParam.set("ptsm min speed", 0.35f, 0.0f, 4.0f));
-	guiParams.add(ptsmSteeringMaxSpeedParam.set("ptsm max speed", 1.8f, 0.05f, 8.0f));
-	guiParams.add(ptsmSpawnTangentParam.set("ptsm spawn tangent", true));
-	guiParams.add(ptsmDebugSteeringParam.set("ptsm debug steering", false));
-	guiParams.add(ptsmLookAtCenterParam.set("ptsm look center", true));
-	guiParams.add(ptsmProbeRadiusParam.set("ptsm particle size", ptsmProbeRadius, 0.001f, 0.04f));
-	guiParams.add(ptsmTrailAlphaParam.set("ptsm trail alpha", ptsmTrailAlpha, 0.0f, 255.0f));
-	guiParams.add(ptsmTrailPresetParam.set("ptsm trail preset", 5, 0, 6));
-	guiParams.add(ptsmTrailRedParam.set("ptsm trail red", ptsmTrailColor.r, 0, 255));
-	guiParams.add(ptsmTrailGreenParam.set("ptsm trail green", ptsmTrailColor.g, 0, 255));
-	guiParams.add(ptsmTrailBlueParam.set("ptsm trail blue", ptsmTrailColor.b, 0, 255));
-	guiParams.add(ptsmTrailSmoothingParam.set("ptsm trail smooth", ptsmTrailSmoothingSize, 0, 20));
-	guiParams.add(ptsmTrailLengthParam.set("ptsm trail length", ptsmSettings.probe.trailLength, 100, 10000));
-	gui.setup(guiParams);
-	gui.setPosition(18, 18);
+
+	ptsmGuiParams.setName("PTSM");
+	ptsmGuiParams.add(ptsmGui.enabled);
+	ptsmGuiParams.add(ptsmGui.showProbe);
+	ptsmGuiParams.add(ptsmGui.sendOsc);
+	ptsmGuiParams.add(ptsmGui.sigma);
+	ptsmGuiParams.add(ptsmGui.fieldGain);
+	ptsmGuiParams.add(ptsmGui.maxKineticEnergy);
+	ptsmGuiParams.add(ptsmGui.energyRatio);
+	ptsmGuiParams.add(ptsmGui.energyRetention);
+	ptsmGuiParams.add(ptsmGui.dt);
+	ptsmGuiParams.add(ptsmGui.maxForce);
+	ptsmGuiParams.add(ptsmGui.maxSpeed);
+	ptsmGuiParams.add(ptsmGui.substeps);
+	ptsmGuiParams.add(ptsmGui.sampleCount);
+	ptsmGuiParams.add(ptsmDensityMixParam.set("ptsm density mix", 0.6f, 0.0f, 1.0f));
+	ptsmGuiParams.add(ptsmFlowCouplingParam.set("ptsm flow follow", 16.0f, 0.0f, 80.0f));
+	ptsmGuiParams.add(ptsmFlowRadiusParam.set("ptsm flow radius", 0.38f, 0.05f, 3.0f));
+	ptsmGuiParams.add(ptsmFlowVelocityScaleParam.set("ptsm flow scale", 130.0f, 0.0f, 300.0f));
+	ptsmGuiParams.add(ptsmFlowVerticalMixParam.set("ptsm flow vertical", 0.68f, 0.0f, 1.0f));
+	ptsmGuiParams.add(ptsmTidalGainParam.set("ptsm tidal gain", 2.0f, 0.0f, 120.0f));
+	ptsmGuiParams.add(ptsmCompressionGainParam.set("ptsm compress gain", 0.0f, 0.0f, 120.0f));
+	ptsmGuiParams.add(ptsmDispersionGainParam.set("ptsm disperse gain", 0.0f, 0.0f, 120.0f));
+	ptsmGuiParams.add(ptsmTargetSpeedParam.set("ptsm target speed", 1.0f, 0.05f, 4.0f));
+	ptsmGuiParams.add(ptsmSpeedHoldParam.set("ptsm speed hold", 12.0f, 0.0f, 40.0f));
+	ptsmGuiParams.add(ptsmTimeScaleParam.set("ptsm time scale", 1.0f, 0.05f, 3.0f));
+	ptsmGuiParams.add(ptsmPlaybackCouplingParam.set("ptsm playback sync", 0.0f, 0.0f, 1.0f));
+	ptsmGuiParams.add(ptsmTurnGainParam.set("ptsm turn gain", 9.0f, 0.0f, 60.0f));
+	ptsmGuiParams.add(ptsmMaxTurnRateParam.set("ptsm max turn rate", 720.0f, 10.0f, 2160.0f));
+	ptsmGuiParams.add(ptsmFlowTurnParam.set("ptsm flow turn", 20.0f, 0.0f, 80.0f));
+	ptsmGuiParams.add(ptsmVortexTurnParam.set("ptsm vortex turn", 20.0f, 0.0f, 80.0f));
+	ptsmGuiParams.add(ptsmDensityTurnParam.set("ptsm density turn", 20.0f, 0.0f, 80.0f));
+	ptsmGuiParams.add(ptsmMinSpeedParam.set("ptsm min speed", 0.35f, 0.0f, 4.0f));
+	ptsmGuiParams.add(ptsmSteeringMaxSpeedParam.set("ptsm max speed", 1.8f, 0.05f, 8.0f));
+	ptsmGuiParams.add(ptsmLookAtCenterParam.set("ptsm look center", true));
+	ptsmGuiParams.add(ptsmProbeRadiusParam.set("ptsm particle size", ptsmProbeRadius, 0.001f, 0.04f));
+	ptsmGuiParams.add(ptsmTrailAlphaParam.set("ptsm trail alpha", ptsmTrailAlpha, 0.0f, 255.0f));
+	ptsmGuiParams.add(ptsmTrailPresetParam.set("ptsm trail preset", 5, 0, 6));
+	ptsmGuiParams.add(ptsmTrailRedParam.set("ptsm trail red", ptsmTrailColor.r, 0, 255));
+	ptsmGuiParams.add(ptsmTrailGreenParam.set("ptsm trail green", ptsmTrailColor.g, 0, 255));
+	ptsmGuiParams.add(ptsmTrailBlueParam.set("ptsm trail blue", ptsmTrailColor.b, 0, 255));
+	ptsmGuiParams.add(ptsmTrailSmoothingParam.set("ptsm trail smooth", ptsmTrailSmoothingSize, 0, 20));
+	ptsmGuiParams.add(ptsmTrailLengthParam.set("ptsm trail length", ptsmSettings.probe.trailLength, 100, 10000));
+
+	gui.setup(guiParams, "collide-vis-gui.xml");
+	ptsmPanel.setup(ptsmGuiParams, "ptsm-gui.xml");
+	gui.setWidthElements(260.0f);
+	ptsmPanel.setWidthElements(260.0f);
+	gui.setName("COLLIDE VIS");
+	ptsmPanel.setName("PTSM");
+	gui.setHeaderBackgroundColor(ofColor(40, 72, 118, 235));
+	ptsmPanel.setHeaderBackgroundColor(ofColor(38, 112, 82, 235));
+	gui.setBackgroundColor(ofColor(18, 20, 26, 220));
+	ptsmPanel.setBackgroundColor(ofColor(15, 28, 24, 220));
+	gui.setBorderColor(ofColor(110, 145, 205, 220));
+	ptsmPanel.setBorderColor(ofColor(95, 190, 145, 220));
+	layoutGuiPanels();
 
 	previousMaxDrawCount = maxDrawCountParam;
 	previousFullResolution = fullResolutionParam;
@@ -2053,17 +2202,85 @@ void ofApp::waitForPendingPrefetch() {
 	}
 }
 
-void ofApp::updatePlaybackPosition(double deltaSeconds) {
+ofApp::PlaybackStopReason ofApp::updatePlaybackPosition(double deltaSeconds) {
 	if(renderFrames.empty()) {
-		return;
+		return PlaybackStopReason::None;
 	}
 	deltaSeconds = std::min(deltaSeconds, 1.0 / 30.0);
-	const double interval = 1.0 / static_cast<double>(std::max(0.001f, playbackFpsParam.get()));
-	playbackFramePosition += deltaSeconds / interval;
-	const double frameCount = static_cast<double>(renderFrames.size());
-	playbackFramePosition = std::fmod(playbackFramePosition, frameCount);
-	if(playbackFramePosition < 0.0) {
-		playbackFramePosition += frameCount;
+	const float activePlaybackFps = cameraWorkReviewPlaying
+		? cameraReviewFpsParam.get()
+		: playbackFpsParam.get();
+	const double interval = 1.0 / static_cast<double>(std::max(0.001f, activePlaybackFps));
+	const double lastFramePosition = std::max(0.0, static_cast<double>(renderFrames.size()) - 1.0);
+	const bool hasCameraWorkStop = playbackStopFrame.has_value() && std::isfinite(*playbackStopFrame);
+	const double stopFramePosition = hasCameraWorkStop
+		? ofClamp(*playbackStopFrame, 0.0, lastFramePosition)
+		: lastFramePosition;
+	const auto stopPlayback = [&]() {
+		playbackFramePosition = stopFramePosition;
+		playing = false;
+		autoRotateParam = false;
+		playbackCarryFrames = 0.0;
+		playbackStopFrame.reset();
+		return hasCameraWorkStop ? PlaybackStopReason::CameraWorkEnd : PlaybackStopReason::RenderEnd;
+	};
+
+	if(playbackFramePosition >= stopFramePosition) {
+		return stopPlayback();
+	}
+
+	double frameAdvance = deltaSeconds / interval;
+	if(cameraWorkReviewPlaying) {
+		frameAdvance += playbackCarryFrames;
+		playbackCarryFrames = 0.0;
+	} else {
+		playbackCarryFrames = 0.0;
+	}
+
+	const double nextFramePosition = playbackFramePosition + frameAdvance;
+	if(cameraWorkReviewPlaying && frameAdvance > 0.0) {
+		const std::vector<double> cameraWorkFrames = collectCameraWorkMarkFrames();
+		constexpr double checkpointEpsilon = 0.0001;
+		auto nextMark = std::upper_bound(
+			cameraWorkFrames.begin(),
+			cameraWorkFrames.end(),
+			playbackFramePosition + checkpointEpsilon
+		);
+		if(nextMark != cameraWorkFrames.end() &&
+		   *nextMark < stopFramePosition - checkpointEpsilon &&
+		   *nextMark <= nextFramePosition + checkpointEpsilon) {
+			playbackCarryFrames = std::max(0.0, nextFramePosition - *nextMark);
+			playbackFramePosition = *nextMark;
+			return PlaybackStopReason::None;
+		}
+	}
+
+	playbackFramePosition = nextFramePosition;
+	if(playbackFramePosition >= stopFramePosition) {
+		return stopPlayback();
+	}
+	return PlaybackStopReason::None;
+}
+
+void ofApp::completeCameraExport() {
+	cameraWorkReviewPlaying = false;
+	playbackCarryFrames = 0.0;
+	autoRotateParam = false;
+	addCameraWorkPoint();
+	const bool cameraSaved = cameraTimeline.save(cameraTimelinePath);
+	const bool rotationSaved = saveRotationCues(rotationCuesPath);
+	const bool ptsmSaved = savePtsmCameraWorkPoints(ptsmCameraWorkPointsPath);
+	if(cameraSaved && rotationSaved && ptsmSaved) {
+		statusMessage = "Camera export complete at frame " + ofToString(playbackFramePosition, 3);
+		if(currentFrameIndex < renderFrames.size()) {
+			statusMessage += " / snapshot " + ofToString(renderFrames[currentFrameIndex].frameNumber);
+		}
+	} else {
+		statusMessage = "Camera export reached end, save failed";
+	}
+	cameraTimeline.setEnabled(false);
+	if(cameraMode == 0) {
+		cam.enableMouseInput();
 	}
 }
 
@@ -2395,6 +2612,9 @@ void ofApp::rebuildPtsmFieldIfNeeded() {
 	if(spawnSettingsChanged) {
 		ptsmCurrentSpawnPosition.reset();
 		ptsmCurrentSpawnVelocity.reset();
+		ptsmLockedSpawnPosition.reset();
+		ptsmLockedSpawnVelocity.reset();
+		ptsmLockedSpawnFrame.reset();
 	}
 
 	std::vector<glm::vec3> currentAttractors;
@@ -2443,7 +2663,7 @@ bool ofApp::buildPtsmFrame(std::size_t frameIndex, std::vector<glm::vec3>& attra
 	candidates.reserve(particles.size());
 	for(const auto& particle : particles) {
 		const int type = static_cast<int>(std::floor(particle.typeIntensity + 0.0001f));
-		if(!typeUsedForDisplayNormalization(type) || !particleTypeEnabled(type)) {
+		if(!typeUsedForDisplayNormalization(type)) {
 			continue;
 		}
 		const glm::vec3 position = transformCachedPositionForPtsm(particle.position);
@@ -2453,13 +2673,7 @@ bool ofApp::buildPtsmFrame(std::size_t frameIndex, std::vector<glm::vec3>& attra
 	}
 
 	if(candidates.empty()) {
-		candidates.reserve(particles.size());
-		for(const auto& particle : particles) {
-			const glm::vec3 position = transformCachedPositionForPtsm(particle.position);
-			if(std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z)) {
-				candidates.push_back(position);
-			}
-		}
+		return false;
 	}
 
 	attractors = compressPtsmAttractors(candidates, std::max(1, ptsmGui.sampleCount.get()));
@@ -2505,7 +2719,7 @@ std::vector<glm::vec3> ofApp::compressPtsmAttractors(const std::vector<glm::vec3
 		compressed.reserve(voxels.size());
 		for(const auto& entry : voxels) {
 			const VoxelAccumulator& voxel = entry.second;
-			compressed.push_back(voxel.sum / static_cast<float>(std::max(1, voxel.count)));
+			compressed.push_back(voxel.sum / static_cast<float>(std::max<std::size_t>(1, voxel.count)));
 		}
 
 		if(static_cast<int>(compressed.size()) <= maxAttractors || gridResolution <= 2) {
@@ -2547,13 +2761,12 @@ bool ofApp::buildPtsmFlowFrame(std::size_t frameIndex, std::vector<PtsmFlowSampl
 	for(std::size_t i = 0; i < count; ++i) {
 		const auto& particle = particles[i];
 		const int type = static_cast<int>(std::floor(particle.typeIntensity + 0.0001f));
-		if(!typeUsedForDisplayNormalization(type) || !particleTypeEnabled(type)) {
+		if(!typeUsedForDisplayNormalization(type)) {
 			continue;
 		}
 
 		const glm::vec3 position = transformCachedPositionForPtsm(particle.position);
 		const glm::vec3 nextPosition = transformCachedPositionForPtsm(nextParticles[i].position);
-		// This is an inter-frame displacement for visualization; ptsm flow scale maps it into display motion.
 		const glm::vec3 velocity = nextPosition - position;
 		if(std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z) &&
 		   std::isfinite(velocity.x) && std::isfinite(velocity.y) && std::isfinite(velocity.z)) {
@@ -2614,7 +2827,7 @@ std::vector<ofApp::PtsmFlowSample> ofApp::compressPtsmFlowSamples(const std::vec
 		compressed.reserve(voxels.size());
 		for(const auto& entry : voxels) {
 			const FlowVoxelAccumulator& voxel = entry.second;
-			const float count = static_cast<float>(std::max(1, voxel.count));
+			const float count = static_cast<float>(std::max<std::size_t>(1, voxel.count));
 			compressed.push_back({
 				voxel.positionSum / count,
 				voxel.velocitySum / count
@@ -2635,7 +2848,6 @@ ofApp::GalaxyFieldLocal ofApp::sampleGalaxyField(const glm::vec3& position, cons
 	if(ptsmFlowSamplesNext.empty()) {
 		return current;
 	}
-
 	const GalaxyFieldLocal next = sampleGalaxyFieldFromFrame(ptsmFlowSamplesNext, position, probeVelocity);
 	const float blend = ofClamp(currentFrameBlend, 0.0f, 1.0f);
 	GalaxyFieldLocal result;
@@ -2643,9 +2855,17 @@ ofApp::GalaxyFieldLocal ofApp::sampleGalaxyField(const glm::vec3& position, cons
 	result.gradU = current.gradU * (1.0f - blend) + next.gradU * blend;
 	result.vorticity = glm::mix(current.vorticity, next.vorticity, blend);
 	result.density = glm::mix(current.density, next.density, blend);
+	result.kernelWeightSum = glm::mix(current.kernelWeightSum, next.kernelWeightSum, blend);
+	result.neighborCount = static_cast<int>(std::round(glm::mix(
+		static_cast<float>(current.neighborCount),
+		static_cast<float>(next.neighborCount),
+		blend
+	)));
+	result.confidence = glm::mix(current.confidence, next.confidence, blend);
 	result.dispersion = glm::mix(current.dispersion, next.dispersion, blend);
 	result.divergence = glm::mix(current.divergence, next.divergence, blend);
 	result.compression = std::max(0.0f, -result.divergence);
+	result.expansion = std::max(0.0f, result.divergence);
 	result.shear = glm::mix(current.shear, next.shear, blend);
 	result.slip = glm::length(result.flowVelocity - probeVelocity);
 	result.vorticityMag = glm::length(result.vorticity);
@@ -2662,25 +2882,32 @@ ofApp::GalaxyFieldLocal ofApp::sampleGalaxyFieldFromFrame(
 	if(samples.empty()) {
 		return result;
 	}
-
 	const float radius = std::max(ptsmFlowRadiusParam.get(), std::numeric_limits<float>::epsilon());
+	const float radiusSquared = radius * radius;
 	const float denom = 2.0f * radius * radius;
 	glm::vec3 weightedVelocity(0.0f);
 	float totalWeight = 0.0f;
+	int neighborCount = 0;
 	for(const auto& sample : samples) {
 		const glm::vec3 delta = position - sample.position;
 		const float squaredDistance = glm::dot(delta, delta);
 		const float weight = std::exp(-squaredDistance / denom);
 		weightedVelocity += sample.velocity * weight;
 		totalWeight += weight;
+		if(squaredDistance <= radiusSquared) {
+			++neighborCount;
+		}
 	}
-
 	if(totalWeight <= std::numeric_limits<float>::epsilon()) {
 		return result;
 	}
-
 	result.flowVelocity = weightedVelocity / totalWeight;
+	result.kernelWeightSum = totalWeight;
+	result.neighborCount = neighborCount;
 	result.density = totalWeight / static_cast<float>(std::max<std::size_t>(1, samples.size()));
+	const float occupancyConfidence = smoothUnit(0.0005f, 0.02f, result.density);
+	const float neighborConfidence = smoothUnit(2.0f, 12.0f, static_cast<float>(neighborCount));
+	result.confidence = std::sqrt(ofClamp(occupancyConfidence * neighborConfidence, 0.0f, 1.0f));
 
 	glm::mat3 crr(0.0f);
 	glm::mat3 cvr(0.0f);
@@ -2700,13 +2927,13 @@ ofApp::GalaxyFieldLocal ofApp::sampleGalaxyFieldFromFrame(
 	result.dispersion = std::sqrt(std::max(0.0f, dispersionSum / totalWeight));
 	result.divergence = result.gradU[0][0] + result.gradU[1][1] + result.gradU[2][2];
 	result.compression = std::max(0.0f, -result.divergence);
+	result.expansion = std::max(0.0f, result.divergence);
 	result.vorticity = glm::vec3(
 		result.gradU[2][1] - result.gradU[1][2],
 		result.gradU[0][2] - result.gradU[2][0],
 		result.gradU[1][0] - result.gradU[0][1]
 	);
 	result.vorticityMag = glm::length(result.vorticity);
-
 	const glm::mat3 strain = (result.gradU + glm::transpose(result.gradU)) * 0.5f;
 	const glm::mat3 deviatoric = strain - glm::mat3(result.divergence / 3.0f);
 	result.shear = frobeniusNorm(deviatoric);
@@ -2718,20 +2945,17 @@ ofApp::GalaxyFieldLocal ofApp::sampleGalaxyFieldFromFrame(
 void ofApp::updatePtsmSteeringPhysics(float dt) {
 	if(ptsmEngine.getProbeCount() == 0) {
 		ptsmLastGalaxyField = GalaxyFieldLocal();
+		ptsmPreviousRawForceValid = false;
 		return;
 	}
-
 	const float stepDt = std::min(std::max(0.0f, dt), kPtsmMaxPhysicsDt);
 	if(stepDt <= std::numeric_limits<float>::epsilon()) {
 		return;
 	}
-
 	const float mass = std::max(ptsmSettings.probe.mass, std::numeric_limits<float>::epsilon());
-	float minSpeed = std::max(0.0f, ptsmMinSpeedParam.get());
-	float maxSpeed = std::max(minSpeed + 0.001f, ptsmSteeringMaxSpeedParam.get());
+	const float minSpeed = std::max(0.0f, ptsmMinSpeedParam.get());
+	const float maxSpeed = std::max(minSpeed + 0.001f, ptsmSteeringMaxSpeedParam.get());
 	const float targetSpeed = ofClamp(ptsmTargetSpeedParam.get(), minSpeed, maxSpeed);
-	const float speedHoldGain = std::max(0.0f, ptsmSpeedHoldParam.get());
-	const float turnGain = std::max(0.0f, ptsmTurnGainParam.get());
 	const float maxTurnAngle = ofDegToRad(std::max(0.0f, ptsmMaxTurnRateParam.get())) * stepDt;
 	const float fieldScale = std::max(0.0f, ptsmFlowVelocityScaleParam.get());
 	const float maxForce = std::max(0.0f, ptsmSettings.probe.maxForce);
@@ -2745,6 +2969,7 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 
 		const glm::vec3 previousPosition = probe->position;
 		const glm::vec3 previousAcceleration = probe->previousAcceleration;
+
 		ptsm::FieldSample densitySample;
 		if(ptsmField.getFrameCount() > 0) {
 			densitySample = ptsmField.sample(probe->position, static_cast<double>(currentFrameBlend));
@@ -2755,9 +2980,7 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 			densitySample.nearestIndex >= 0 ||
 			glm::dot(densitySample.force, densitySample.force) > std::numeric_limits<float>::epsilon();
 		local.densityForce = isFiniteVec3(densitySample.force) ? densitySample.force : glm::vec3(0.0f);
-		local.scaledFlowVelocity = isFiniteVec3(local.flowVelocity)
-			? local.flowVelocity * fieldScale
-			: glm::vec3(0.0f);
+		local.scaledFlowVelocity = isFiniteVec3(local.flowVelocity) ? local.flowVelocity * fieldScale : glm::vec3(0.0f);
 
 		const float currentSpeed = glm::length(probe->velocity);
 		glm::vec3 fallbackDirection = safeNormalizeOr(
@@ -2769,10 +2992,8 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 			fallbackDirection = local.scaledFlowVelocity / scaledFlowSpeed;
 		} else if(glm::dot(local.densityForce, local.densityForce) > std::numeric_limits<float>::epsilon()) {
 			const glm::vec3 axis = safeNormalizeOr(local.vorticity, glm::vec3(0.0f, 1.0f, 0.0f));
-			const glm::vec3 tangent = glm::cross(axis, local.densityForce);
-			fallbackDirection = safeNormalizeOr(tangent, fallbackDirection);
+			fallbackDirection = safeNormalizeOr(glm::cross(axis, local.densityForce), fallbackDirection);
 		}
-
 		const glm::vec3 direction = currentSpeed > std::numeric_limits<float>::epsilon()
 			? probe->velocity / currentSpeed
 			: fallbackDirection;
@@ -2783,12 +3004,12 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 		const float densityForceMag = glm::length(local.densityForce);
 		if(densityForceMag > 0.000001f) {
 			const float densityStrength = densityForceMag / (densityForceMag + 0.04f);
-			densityForce =
-				(local.densityForce / densityForceMag) *
+			densityForce = (local.densityForce / densityForceMag) *
 				densityStrength *
 				std::max(0.0f, ptsmDensityTurnParam.get()) *
 				mass;
 		}
+
 		glm::vec3 flowForce(0.0f);
 		if(scaledFlowSpeed > 0.00001f) {
 			const glm::vec3 flowDirection = local.scaledFlowVelocity / scaledFlowSpeed;
@@ -2796,7 +3017,6 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 			const float flowStrength = scaledFlowSpeed / (scaledFlowSpeed + std::max(0.05f, targetSpeed));
 			flowForce += flowLateral * flowStrength * std::max(0.0f, ptsmFlowTurnParam.get()) * mass;
 		}
-		// Keep legacy flow-follow available, but only as a lateral steering cue in constant-speed mode.
 		const glm::vec3 flowFollowLateral = slipVector - direction * glm::dot(slipVector, direction);
 		flowForce += flowFollowLateral * (std::max(0.0f, ptsmFlowCouplingParam.get()) * 0.15f) * mass;
 
@@ -2806,26 +3026,24 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 		if(scaledVorticityMag > 0.00001f) {
 			const glm::vec3 vortexAxis = scaledVorticity / scaledVorticityMag;
 			const float softenedOmega = scaledVorticityMag / (scaledVorticityMag + 1.0f);
-			vortexForce =
-				glm::cross(vortexAxis, direction) *
+			vortexForce = glm::cross(vortexAxis, direction) *
 				softenedOmega *
 				std::max(0.0f, ptsmVortexTurnParam.get()) *
 				mass;
 		}
 
-		glm::vec3 tidalAcceleration = (local.gradU * probe->velocity) *
+		glm::vec3 tidalAcceleration =
+			(local.gradU * probe->velocity) *
 			fieldScale *
 			std::max(0.0f, ptsmTidalGainParam.get());
 		if(!isFiniteVec3(tidalAcceleration)) {
 			tidalAcceleration = glm::vec3(0.0f);
 		}
-
 		const glm::vec3 compressionAcceleration =
 			slipDirection *
 			local.compression *
 			fieldScale *
 			std::max(0.0f, ptsmCompressionGainParam.get());
-
 		const glm::vec3 stableNoise(
 			std::sin(probe->position.x * 12.9898f + probe->position.y * 78.233f + 0.31f),
 			std::sin(probe->position.y * 37.719f + probe->position.z * 11.135f + 1.17f),
@@ -2842,11 +3060,7 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 			fieldScale *
 			std::max(0.0f, ptsmDispersionGainParam.get());
 
-		glm::vec3 tidalForce = (
-			tidalAcceleration +
-			compressionAcceleration +
-			dispersionAcceleration
-		) * mass + vortexForce;
+		glm::vec3 tidalForce = (tidalAcceleration + compressionAcceleration + dispersionAcceleration) * mass + vortexForce;
 		glm::vec3 rawForce = densityForce + flowForce + tidalForce;
 		if(!isFiniteVec3(rawForce)) {
 			rawForce = glm::vec3(0.0f);
@@ -2863,15 +3077,12 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 		}
 
 		const glm::vec3 parallelForce = direction * glm::dot(rawForce, direction);
-		glm::vec3 lateralForce = rawForce - parallelForce;
-		lateralForce = limitVectorLength(lateralForce, maxForce);
-
-		const glm::vec3 steeringAcceleration = (lateralForce / mass) * turnGain;
+		glm::vec3 lateralForce = limitVectorLength(rawForce - parallelForce, maxForce);
+		const glm::vec3 steeringAcceleration =
+			(lateralForce / mass) *
+			std::max(0.0f, ptsmTurnGainParam.get());
 		const float directionSpeed = std::max(currentSpeed, minSpeed);
-		glm::vec3 candidateDirection = safeNormalizeOr(
-			direction * directionSpeed + steeringAcceleration * stepDt,
-			direction
-		);
+		glm::vec3 candidateDirection = safeNormalizeOr(direction * directionSpeed + steeringAcceleration * stepDt, direction);
 		const float requestedTurnAngle = safeAngleBetween(direction, candidateDirection);
 		glm::vec3 newDirection = candidateDirection;
 		if(maxTurnAngle <= std::numeric_limits<float>::epsilon()) {
@@ -2881,8 +3092,8 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 			newDirection = safeNormalizeOr(glm::mix(direction, candidateDirection, amount), direction);
 		}
 
-		const float speedBlend = speedHoldGain > 0.0f
-			? 1.0f - std::exp(-speedHoldGain * stepDt)
+		const float speedBlend = ptsmSpeedHoldParam.get() > 0.0f
+			? 1.0f - std::exp(-ptsmSpeedHoldParam.get() * stepDt)
 			: 0.0f;
 		float newSpeed = currentSpeed + (targetSpeed - currentSpeed) * speedBlend;
 		if(!std::isfinite(newSpeed)) {
@@ -2901,7 +3112,15 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 			probe->position = previousPosition;
 		}
 
-		applyPtsmProbeBounds(*probe);
+		glm::vec3 boundsMin(0.0f);
+		glm::vec3 boundsMax(0.0f);
+		getVisibleBounds(boundsMin, boundsMax);
+		for(int axis = 0; axis < 3; ++axis) {
+			if(probe->position[axis] < boundsMin[axis] || probe->position[axis] > boundsMax[axis]) {
+				probe->position[axis] = ofClamp(probe->position[axis], boundsMin[axis], boundsMax[axis]);
+				probe->velocity[axis] *= -ptsmSettings.probe.boundaryBounce;
+			}
+		}
 		const float boundedSpeed = glm::length(probe->velocity);
 		if(boundedSpeed > maxSpeed && boundedSpeed > std::numeric_limits<float>::epsilon()) {
 			probe->velocity *= maxSpeed / boundedSpeed;
@@ -2945,8 +3164,12 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 				local.scaledFlowVelocity / scaledFlowSpeed
 			);
 		}
-
 		if(!capturedMetrics) {
+			local.rawForceChangeRate = ptsmPreviousRawForceValid
+				? glm::length(rawForce - ptsmPreviousRawForce) / safeDt
+				: 0.0f;
+			ptsmPreviousRawForce = rawForce;
+			ptsmPreviousRawForceValid = true;
 			ptsmLastGalaxyField = local;
 			capturedMetrics = true;
 		}
@@ -2954,124 +3177,8 @@ void ofApp::updatePtsmSteeringPhysics(float dt) {
 
 	if(!capturedMetrics) {
 		ptsmLastGalaxyField = GalaxyFieldLocal();
+		ptsmPreviousRawForceValid = false;
 	}
-}
-
-void ofApp::applyPtsmFlowForces(float dt) {
-	if(ptsmFlowCouplingParam <= 0.0f || ptsmEngine.getProbeCount() == 0) {
-		ptsmLastGalaxyField = GalaxyFieldLocal();
-		return;
-	}
-
-	ptsm::ProbeState* probe = ptsmEngine.getMutableProbeState(0);
-	if(probe == nullptr) {
-		ptsmLastGalaxyField = GalaxyFieldLocal();
-		return;
-	}
-
-	GalaxyFieldLocal local = sampleGalaxyField(probe->position, probe->velocity);
-	if(!local.valid) {
-		ptsmLastGalaxyField = local;
-		return;
-	}
-
-	const float fieldScale = std::max(0.0f, ptsmFlowVelocityScaleParam.get());
-	const glm::vec3 localFlowVelocity = local.flowVelocity * fieldScale;
-	const glm::vec3 densityForce = probe->field.force;
-	const glm::vec3 slipVector = localFlowVelocity - probe->velocity;
-	const glm::vec3 slipDirection = glm::length(slipVector) > std::numeric_limits<float>::epsilon()
-		? glm::normalize(slipVector)
-		: randomUnitVector();
-	const glm::vec3 velocityDirection = glm::length(probe->velocity) > std::numeric_limits<float>::epsilon()
-		? glm::normalize(probe->velocity)
-		: slipDirection;
-	const glm::vec3 desiredAcceleration =
-		slipVector *
-		std::max(0.0f, ptsmFlowCouplingParam.get());
-	const glm::vec3 tidalAcceleration =
-		(local.gradU * probe->velocity) *
-		fieldScale *
-		std::max(0.0f, ptsmTidalGainParam.get());
-	glm::vec3 vortexAxis = local.vorticity;
-	if(glm::length(vortexAxis) > std::numeric_limits<float>::epsilon()) {
-		vortexAxis = glm::normalize(vortexAxis);
-	}
-	const glm::vec3 vortexAcceleration =
-		glm::cross(vortexAxis, velocityDirection) *
-		local.vorticityMag *
-		fieldScale *
-		std::max(0.0f, ptsmVorticityGainParam.get());
-	const glm::vec3 compressionAcceleration =
-		slipDirection *
-		local.compression *
-		fieldScale *
-		std::max(0.0f, ptsmCompressionGainParam.get());
-	const glm::vec3 dispersionAcceleration =
-		(glm::normalize(slipDirection + velocityDirection * 0.35f)) *
-		local.dispersion *
-		fieldScale *
-		std::max(0.0f, ptsmDispersionGainParam.get());
-	const float mass = std::max(ptsmSettings.probe.mass, std::numeric_limits<float>::epsilon());
-	glm::vec3 flowForce = desiredAcceleration * mass;
-	glm::vec3 tidalForce = (
-		tidalAcceleration +
-		vortexAcceleration +
-		compressionAcceleration +
-		dispersionAcceleration
-	) * mass;
-	glm::vec3 totalForce = flowForce + tidalForce;
-	if(ptsmSettings.probe.maxForce > 0.0f) {
-		const float forceLength = glm::length(totalForce);
-		if(forceLength > ptsmSettings.probe.maxForce && forceLength > std::numeric_limits<float>::epsilon()) {
-			const float forceScale = ptsmSettings.probe.maxForce / forceLength;
-			flowForce *= forceScale;
-			tidalForce *= forceScale;
-			totalForce *= forceScale;
-		}
-	}
-
-	const glm::vec3 previousVelocity = probe->velocity;
-	const glm::vec3 previousAcceleration = probe->previousAcceleration;
-	const glm::vec3 acceleration = totalForce / mass;
-	probe->velocity += std::max(0.0f, dt) * acceleration;
-	if(ptsmSettings.probe.maxSpeed > 0.0f) {
-		const float speed = glm::length(probe->velocity);
-		if(speed > ptsmSettings.probe.maxSpeed && speed > std::numeric_limits<float>::epsilon()) {
-			probe->velocity *= ptsmSettings.probe.maxSpeed / speed;
-		}
-	}
-	const float safeDt = std::max(dt, std::numeric_limits<float>::epsilon());
-	probe->jerk = glm::length(acceleration - previousAcceleration) / safeDt;
-	probe->previousAcceleration = acceleration;
-	probe->field.force += totalForce;
-	const glm::vec3 rawForce = densityForce + totalForce;
-	const glm::vec3 finalDirection = safeNormalizeOr(probe->velocity, velocityDirection);
-	const glm::vec3 parallelForce = finalDirection * glm::dot(rawForce, finalDirection);
-	const glm::vec3 lateralForce = rawForce - parallelForce;
-	local.scaledFlowVelocity = localFlowVelocity;
-	local.densityForce = densityForce;
-	local.flowForce = flowForce;
-	local.tidalForce = tidalForce;
-	local.rawForce = rawForce;
-	local.parallelForce = parallelForce;
-	local.lateralForce = lateralForce;
-	local.totalForce = probe->field.force;
-	local.rawForceMag = glm::length(rawForce);
-	local.lateralForceMag = glm::length(lateralForce);
-	local.parallelForceMag = glm::length(parallelForce);
-	local.turnRate = safeAngleBetween(previousVelocity, probe->velocity) / safeDt;
-	local.steeringCurvature = local.turnRate / std::max(glm::length(probe->velocity), std::numeric_limits<float>::epsilon());
-	local.targetSpeed = ptsmTargetSpeedParam.get();
-	local.currentSpeed = glm::length(probe->velocity);
-	local.speedError = local.targetSpeed - local.currentSpeed;
-	local.flowAlignment = 0.0f;
-	const float localFlowSpeed = glm::length(localFlowVelocity);
-	if(localFlowSpeed > std::numeric_limits<float>::epsilon() &&
-	   local.currentSpeed > std::numeric_limits<float>::epsilon()) {
-		local.flowAlignment = glm::dot(finalDirection, localFlowVelocity / localFlowSpeed);
-	}
-	local.slip = glm::length(localFlowVelocity - probe->velocity);
-	ptsmLastGalaxyField = local;
 }
 
 glm::mat3 ofApp::outerProduct(const glm::vec3& a, const glm::vec3& b) const {
@@ -3131,8 +3238,7 @@ float ofApp::safeAngleBetween(const glm::vec3& from, const glm::vec3& to) const 
 	   toLength <= std::numeric_limits<float>::epsilon()) {
 		return 0.0f;
 	}
-	const float dotValue = ofClamp(glm::dot(from, to) / (fromLength * toLength), -1.0f, 1.0f);
-	return std::acos(dotValue);
+	return std::acos(ofClamp(glm::dot(from, to) / (fromLength * toLength), -1.0f, 1.0f));
 }
 
 void ofApp::applyPtsmProbeBounds(ptsm::ProbeState& probe) const {
@@ -3156,7 +3262,7 @@ void ofApp::applyPtsmProbeBounds(ptsm::ProbeState& probe) const {
 }
 
 void ofApp::appendPtsmProbeTrail(ptsm::ProbeState& probe) {
-	const int trailLength = std::max(1, ptsmEngine.getConfig().trailLength);
+	const int trailLength = std::max(1, ptsmSettings.probe.trailLength);
 	probe.trail.push_back(probe.position);
 	while(static_cast<int>(probe.trail.size()) > trailLength) {
 		probe.trail.pop_front();
@@ -3185,40 +3291,6 @@ float ofApp::computePtsmProbeCurvature(const ptsm::ProbeState& probe) const {
 		return 0.0f;
 	}
 	return glm::length((segB / lenB) - (segA / lenA)) / arcLength;
-}
-
-glm::vec3 ofApp::ptsmTangentVelocityForSpawn(const glm::vec3& position, const glm::vec3& fallbackVelocity) const {
-	float minSpeed = std::max(0.0f, ptsmMinSpeedParam.get());
-	float maxSpeed = std::max(minSpeed + 0.001f, ptsmSteeringMaxSpeedParam.get());
-	const float targetSpeed = ofClamp(ptsmTargetSpeedParam.get(), minSpeed, maxSpeed);
-	const glm::vec3 previousDirection = safeNormalizeOr(fallbackVelocity, glm::vec3(1.0f, 0.0f, 0.0f));
-
-	ptsm::FieldSample densitySample;
-	if(ptsmField.getFrameCount() > 0) {
-		densitySample = ptsmField.sample(position, static_cast<double>(currentFrameBlend));
-	}
-	GalaxyFieldLocal local = sampleGalaxyField(position, fallbackVelocity);
-	const glm::vec3 inward = safeNormalizeOr(
-		densitySample.force,
-		safeNormalizeOr(-position, previousDirection)
-	);
-
-	glm::vec3 rotationAxis = safeNormalizeOr(local.vorticity, glm::vec3(0.0f, 1.0f, 0.0f));
-	if(glm::dot(local.vorticity, local.vorticity) <= 0.000001f) {
-		const glm::vec3 flowDirection = safeNormalizeOr(local.flowVelocity, glm::vec3(0.0f));
-		const glm::vec3 inferredAxis = glm::cross(inward, flowDirection);
-		rotationAxis = safeNormalizeOr(inferredAxis, glm::vec3(0.0f, 1.0f, 0.0f));
-	}
-
-	glm::vec3 tangent = glm::cross(rotationAxis, inward);
-	if(glm::dot(tangent, tangent) <= std::numeric_limits<float>::epsilon()) {
-		tangent = glm::cross(glm::vec3(1.0f, 0.0f, 0.0f), inward);
-	}
-	tangent = safeNormalizeOr(tangent, previousDirection);
-	if(glm::dot(tangent, previousDirection) < 0.0f) {
-		tangent *= -1.0f;
-	}
-	return tangent * targetSpeed;
 }
 
 glm::vec3 ofApp::randomUnitVector() const {
@@ -3323,9 +3395,6 @@ void ofApp::choosePtsmSpawn(glm::vec3& position, glm::vec3& velocity) {
 	}
 	if(!ptsmCurrentSpawnPosition.has_value() || !ptsmCurrentSpawnVelocity.has_value()) {
 		samplePtsmAuditionSpawn(position, velocity);
-		if(ptsmConstantSpeedParam && ptsmSpawnTangentParam) {
-			velocity = ptsmTangentVelocityForSpawn(position, velocity);
-		}
 		ptsmCurrentSpawnPosition = position;
 		ptsmCurrentSpawnVelocity = velocity;
 		return;
@@ -3353,11 +3422,13 @@ void ofApp::spawnPtsmProbe() {
 	const float speed = glm::length(velocity);
 	const glm::vec3 direction = speed > std::numeric_limits<float>::epsilon()
 		? velocity / speed
-		: randomUnitVector();
+		: safeNormalizeOr(cameraForward, glm::vec3(1.0f, 0.0f, 0.0f));
 	clearPtsmProbes();
 	ptsmEngine.spawnProbe(origin, velocity);
 	ptsmDisplayPosition = origin;
 	ptsmDisplayVelocity = velocity;
+	ptsmPreviousRawForce = glm::vec3(0.0f);
+	ptsmPreviousRawForceValid = false;
 	cameraForward = direction;
 	const glm::vec3 desiredRight = glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), cameraForward);
 	if(glm::dot(desiredRight, desiredRight) > std::numeric_limits<float>::epsilon()) {
@@ -3368,22 +3439,127 @@ void ofApp::spawnPtsmProbe() {
 	statusMessage = "Injected PTSM probe " + ofToString(ptsmEngine.getProbeCount());
 }
 
+bool ofApp::setPtsmProbeState(const glm::vec3& position, const glm::vec3& velocity) {
+	if(!isFiniteVec3(position) || !isFiniteVec3(velocity)) {
+		return false;
+	}
+	if(preloadReady && !renderFrames.empty()) {
+		syncPtsmSettings();
+		rebuildPtsmFieldIfNeeded();
+	}
+
+	ptsmEngine.clearProbes();
+	ptsmLastGalaxyField = GalaxyFieldLocal();
+	ptsmPreviousRawForce = glm::vec3(0.0f);
+	ptsmPreviousRawForceValid = false;
+	ptsmTrailCache.clear();
+	ptsmSmoothedTrailCache.clear();
+	ptsmEngine.spawnProbe(position, velocity);
+	ptsmDisplayPosition = position;
+	ptsmDisplayVelocity = velocity;
+	ptsmCurrentSpawnPosition = position;
+	ptsmCurrentSpawnVelocity = velocity;
+
+	const float speed = glm::length(velocity);
+	cameraForward = speed > std::numeric_limits<float>::epsilon()
+		? velocity / speed
+		: safeNormalizeOr(cameraForward, glm::vec3(1.0f, 0.0f, 0.0f));
+	const glm::vec3 desiredRight = glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), cameraForward);
+	if(glm::dot(desiredRight, desiredRight) > std::numeric_limits<float>::epsilon()) {
+		cameraRight = glm::normalize(desiredRight);
+	}
+	smoothedCameraPosition = position;
+	smoothedCameraTarget = position + cameraForward * firstPersonLookAhead;
+	cameraStateInitialized = false;
+	ptsmTrailCachedSize = 0;
+	ptsmTrailCachedLastPoint = position;
+	ptsmTrailCacheValid = false;
+	return true;
+}
+
+bool ofApp::spawnPtsmProbeFromSavedLock() {
+	ptsmCurrentSpawnPosition.reset();
+	ptsmCurrentSpawnVelocity.reset();
+	ptsmLockedSpawnPosition.reset();
+	ptsmLockedSpawnVelocity.reset();
+	ptsmLockedSpawnFrame.reset();
+
+	if(!loadPtsmSpawnLock(ptsmSpawnLockPath)) {
+		return false;
+	}
+	if(!ptsmLockedSpawnPosition.has_value() || !ptsmLockedSpawnVelocity.has_value()) {
+		statusMessage = "PTSM spawn JSON did not provide a spawn";
+		return false;
+	}
+
+	const glm::vec3 origin = *ptsmLockedSpawnPosition;
+	const glm::vec3 velocity = *ptsmLockedSpawnVelocity;
+	const bool rewoundFrame = ptsmLockedSpawnFrame.has_value() && preloadReady && !renderFrames.empty();
+	const double savedFrame = rewoundFrame ? *ptsmLockedSpawnFrame : playbackFramePosition;
+		if(rewoundFrame) {
+			playing = false;
+			cameraWorkReviewPlaying = false;
+			playbackCarryFrames = 0.0;
+			autoRotateParam = false;
+			playbackStopFrame.reset();
+		playbackFramePosition = savedFrame;
+		applyPlaybackPosition(true);
+		applyRotationCues(playbackFramePosition);
+		cameraTimeline.apply(playbackFramePosition);
+		constrainCameraDistance();
+		syncDisplaySettings();
+	}
+
+	if(!preloadReady || renderFrames.empty()) {
+		statusMessage = "PTSM needs loaded frames";
+		return false;
+	}
+
+	syncPtsmSettings();
+	rebuildPtsmFieldIfNeeded();
+	if(ptsmField.getFrameCount() == 0 || ptsmField.getFrame(0).empty()) {
+		statusMessage = "PTSM field has no attractors";
+		return false;
+	}
+
+	ptsmLockedSpawnPosition = origin;
+	ptsmLockedSpawnVelocity = velocity;
+	if(rewoundFrame) {
+		ptsmLockedSpawnFrame = savedFrame;
+	}
+	ptsmCurrentSpawnPosition = origin;
+	ptsmCurrentSpawnVelocity = velocity;
+
+	if(!setPtsmProbeState(origin, velocity)) {
+		statusMessage = "Failed to restore PTSM probe from JSON";
+		return false;
+	}
+	if(rewoundFrame) {
+		statusMessage = "Injected PTSM probe from JSON at frame " + ofToString(savedFrame, 3);
+	} else {
+		statusMessage = "Injected PTSM probe from JSON";
+	}
+	return true;
+}
+
 void ofApp::lockPtsmSpawn() {
-	if(!ptsmCurrentSpawnPosition.has_value() || !ptsmCurrentSpawnVelocity.has_value()) {
-		glm::vec3 position(0.0f);
-		glm::vec3 velocity(0.0f);
-		samplePtsmAuditionSpawn(position, velocity);
-		if(ptsmConstantSpeedParam && ptsmSpawnTangentParam) {
-			velocity = ptsmTangentVelocityForSpawn(position, velocity);
+	if(const ptsm::ProbeState* probe = ptsmEngine.getProbeState(0)) {
+		if(probe->alive && isFiniteVec3(probe->position) && isFiniteVec3(probe->velocity)) {
+			ptsmCurrentSpawnPosition = probe->position;
+			ptsmCurrentSpawnVelocity = probe->velocity;
 		}
-		ptsmCurrentSpawnPosition = position;
-		ptsmCurrentSpawnVelocity = velocity;
+	}
+
+	if(!ptsmCurrentSpawnPosition.has_value() || !ptsmCurrentSpawnVelocity.has_value()) {
+		statusMessage = "No PTSM probe to save";
+		return;
 	}
 
 	ptsmLockedSpawnPosition = ptsmCurrentSpawnPosition;
 	ptsmLockedSpawnVelocity = ptsmCurrentSpawnVelocity;
+	ptsmLockedSpawnFrame = playbackFramePosition;
 	const bool saved = savePtsmSpawnLock(ptsmSpawnLockPath);
-	statusMessage = saved ? "Locked PTSM spawn" : "Locked PTSM spawn, save failed";
+	statusMessage = saved ? "Saved PTSM spawn JSON" : "Locked PTSM spawn, save failed";
 	ofLogNotice() << "[collide-vis] Locked PTSM spawn at "
 		<< ptsmLockedSpawnPosition->x << ", "
 		<< ptsmLockedSpawnPosition->y << ", "
@@ -3394,21 +3570,10 @@ void ofApp::lockPtsmSpawn() {
 		<< ptsmLockedSpawnVelocity->z;
 }
 
-void ofApp::clearPtsmSpawnLock() {
-	ptsmCurrentSpawnPosition.reset();
-	ptsmCurrentSpawnVelocity.reset();
-	ptsmLockedSpawnPosition.reset();
-	ptsmLockedSpawnVelocity.reset();
-
-	const std::string resolvedPath = ofToDataPath(ptsmSpawnLockPath, true);
-	std::error_code ec;
-	std::filesystem::remove(resolvedPath, ec);
-	statusMessage = ec ? "Failed to clear PTSM spawn lock" : "Cleared PTSM spawn lock";
-}
-
 bool ofApp::loadPtsmSpawnLock(const std::string& path) {
 	const std::string resolvedPath = ofToDataPath(path, true);
 	if(!ofFile::doesFileExist(resolvedPath)) {
+		statusMessage = "PTSM spawn JSON not found";
 		return false;
 	}
 
@@ -3416,14 +3581,14 @@ bool ofApp::loadPtsmSpawnLock(const std::string& path) {
 	try {
 		json = ofLoadJson(resolvedPath);
 	} catch(const std::exception& error) {
-		statusMessage = "Failed to load PTSM spawn lock: " + std::string(error.what());
+		statusMessage = "Failed to load PTSM spawn JSON: " + std::string(error.what());
 		return false;
 	}
 
 	if(!json.contains("position") || !json.contains("velocity") ||
 	   !json["position"].is_array() || !json["velocity"].is_array() ||
 	   json["position"].size() < 3 || json["velocity"].size() < 3) {
-		statusMessage = "PTSM spawn lock file is invalid";
+		statusMessage = "PTSM spawn JSON is invalid";
 		return false;
 	}
 
@@ -3441,19 +3606,28 @@ bool ofApp::loadPtsmSpawnLock(const std::string& path) {
 			json["velocity"][2].get<float>()
 		);
 	} catch(const std::exception& error) {
-		statusMessage = "Failed to parse PTSM spawn lock: " + std::string(error.what());
+		statusMessage = "Failed to parse PTSM spawn JSON: " + std::string(error.what());
 		return false;
 	}
 	if(!isFiniteVec3(position) || !isFiniteVec3(velocity)) {
-		statusMessage = "PTSM spawn lock has non-finite values";
+		statusMessage = "PTSM spawn JSON has non-finite values";
 		return false;
+	}
+
+	std::optional<double> savedFrame;
+	if(json.contains("frame") && json["frame"].is_number()) {
+		const double frame = json["frame"].get<double>();
+		if(std::isfinite(frame)) {
+			savedFrame = frame;
+		}
 	}
 
 	ptsmLockedSpawnPosition = position;
 	ptsmLockedSpawnVelocity = velocity;
+	ptsmLockedSpawnFrame = savedFrame;
 	ptsmCurrentSpawnPosition = position;
 	ptsmCurrentSpawnVelocity = velocity;
-	statusMessage = "Loaded PTSM spawn lock";
+	statusMessage = "Loaded PTSM spawn JSON";
 	return true;
 }
 
@@ -3465,6 +3639,10 @@ bool ofApp::savePtsmSpawnLock(const std::string& path) const {
 	const std::string resolvedPath = ofToDataPath(path, true);
 	ofJson json;
 	json["version"] = 1;
+	json["frame"] = ptsmLockedSpawnFrame.value_or(playbackFramePosition);
+	if(currentFrameIndex < renderFrames.size()) {
+		json["renderFrameNumber"] = renderFrames[currentFrameIndex].frameNumber;
+	}
 	json["position"] = {
 		ptsmLockedSpawnPosition->x,
 		ptsmLockedSpawnPosition->y,
@@ -3487,6 +3665,8 @@ bool ofApp::savePtsmSpawnLock(const std::string& path) const {
 void ofApp::clearPtsmProbes() {
 	ptsmEngine.clearProbes();
 	ptsmLastGalaxyField = GalaxyFieldLocal();
+	ptsmPreviousRawForce = glm::vec3(0.0f);
+	ptsmPreviousRawForceValid = false;
 	ptsmTrailCache.clear();
 	ptsmSmoothedTrailCache.clear();
 	ptsmTrailCachedSize = 0;
@@ -3497,15 +3677,23 @@ void ofApp::clearPtsmProbes() {
 
 void ofApp::resetAllState() {
 	playing = false;
+	cameraWorkReviewPlaying = false;
+	playbackCarryFrames = 0.0;
+	autoRotateParam = false;
+	playbackStopFrame.reset();
 	playbackFramePosition = 0.0;
 	currentFrameIndex = 0;
 	currentFrameBlend = 0.0f;
 	rotationDegrees = 0.0f;
+	autoRotationDegrees = 0.0f;
 	lastRotationCueWeight = 0.0f;
 
 	clearPtsmProbes();
 	ptsmCurrentSpawnPosition.reset();
 	ptsmCurrentSpawnVelocity.reset();
+	ptsmLockedSpawnPosition.reset();
+	ptsmLockedSpawnVelocity.reset();
+	ptsmLockedSpawnFrame.reset();
 	ptsmDisplayPosition = glm::vec3(0.0f);
 	ptsmDisplayVelocity = glm::vec3(0.0f);
 
@@ -3698,25 +3886,6 @@ void ofApp::drawPtsmProbes() {
 		ofPopMatrix();
 	}
 
-	if(ptsmDebugSteeringParam && ptsmLastGalaxyField.valid) {
-		const glm::vec3 origin = probe->position;
-		const auto drawVector = [&](const glm::vec3& vector, const ofColor& color, float scale, float maxLength) {
-			glm::vec3 line = limitVectorLength(vector * scale, maxLength);
-			if(glm::dot(line, line) <= std::numeric_limits<float>::epsilon()) {
-				return;
-			}
-			ofSetColor(color);
-			ofDrawLine(origin, origin + line);
-		};
-
-		ofSetLineWidth(1.6f);
-		drawVector(probe->velocity, ofColor(80, 220, 255, 230), 0.18f, 0.18f);
-		drawVector(ptsmLastGalaxyField.totalForce, ofColor(255, 72, 72, 210), 0.004f, 0.28f);
-		drawVector(ptsmLastGalaxyField.lateralForce, ofColor(70, 255, 130, 220), 0.006f, 0.28f);
-		drawVector(ptsmLastGalaxyField.parallelForce, ofColor(120, 150, 255, 180), 0.006f, 0.22f);
-		drawVector(ptsmLastGalaxyField.scaledFlowVelocity, ofColor(210, 96, 255, 210), 0.04f, 0.24f);
-		drawVector(ptsmLastGalaxyField.vorticity, ofColor(255, 230, 80, 210), 0.16f, 0.16f);
-	}
 	ofDisableBlendMode();
 	ofPopStyle();
 }
@@ -3768,16 +3937,11 @@ void ofApp::sendPtsmMetrics() {
 		ptsm::addFloatMessage(bundle, prefix + "/galaxy/vorticityBodyY", vorticityBody.y);
 		ptsm::addFloatMessage(bundle, prefix + "/galaxy/vorticityBodyZ", vorticityBody.z);
 		ptsm::addFloatMessage(bundle, prefix + "/galaxy/shear", ptsmLastGalaxyField.shear);
-		ptsm::addFloatMessage(bundle, prefix + "/galaxy/rawForceMag", ptsmLastGalaxyField.rawForceMag);
-		ptsm::addFloatMessage(bundle, prefix + "/galaxy/lateralForceMag", ptsmLastGalaxyField.lateralForceMag);
-		ptsm::addFloatMessage(bundle, prefix + "/galaxy/parallelForceMag", ptsmLastGalaxyField.parallelForceMag);
-		ptsm::addFloatMessage(bundle, prefix + "/galaxy/turnRate", ptsmLastGalaxyField.turnRate);
-		ptsm::addFloatMessage(bundle, prefix + "/galaxy/curvature", ptsmLastGalaxyField.steeringCurvature);
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/densityForceMag", glm::length(ptsmLastGalaxyField.densityForce));
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/flowForceMag", glm::length(ptsmLastGalaxyField.flowForce));
+		ptsm::addFloatMessage(bundle, prefix + "/galaxy/tidalForceMag", glm::length(ptsmLastGalaxyField.tidalForce));
 		ptsm::addFloatMessage(bundle, prefix + "/galaxy/flowAlignment", ptsmLastGalaxyField.flowAlignment);
-		ptsm::addFloatMessage(bundle, prefix + "/galaxy/vorticityMag", ptsmLastGalaxyField.vorticityMag);
-		ptsm::addFloatMessage(bundle, prefix + "/galaxy/speedError", ptsmLastGalaxyField.speedError);
 		ptsm::addFloatMessage(bundle, prefix + "/galaxy/currentSpeed", ptsmLastGalaxyField.currentSpeed);
-		ptsm::addFloatMessage(bundle, prefix + "/galaxy/targetSpeed", ptsmLastGalaxyField.targetSpeed);
 	}
 	ptsmOscSender.sendBundle(bundle);
 }
@@ -3804,12 +3968,258 @@ std::string ofApp::colorPaletteLabel() const {
 	}
 }
 
-void ofApp::addRotationCue() {
-	RotationCue cue;
-	cue.frame = playbackFramePosition;
-	cue.degrees = normalizeDegrees(rotationDegrees);
-	cue.influenceFrames = rotationCueInfluenceFrames;
+std::vector<double> ofApp::collectCameraWorkMarkFrames() const {
+	std::vector<double> frames;
+	const auto& cameraKeyframes = cameraTimeline.getKeyframes();
+	if(!cameraKeyframes.empty()) {
+		frames.reserve(cameraKeyframes.size());
+		for(const auto& keyframe : cameraKeyframes) {
+			frames.push_back(keyframe.frame);
+		}
+	} else {
+		frames.reserve(rotationCues.size());
+		for(const auto& cue : rotationCues) {
+			frames.push_back(cue.frame);
+		}
+	}
+	if(frames.empty()) {
+		return frames;
+	}
 
+	std::sort(frames.begin(), frames.end());
+	constexpr double mergeEpsilon = 0.0001;
+	auto uniqueEnd = std::unique(
+		frames.begin(),
+		frames.end(),
+		[](double a, double b) {
+			return std::abs(a - b) <= mergeEpsilon;
+		}
+	);
+	frames.erase(uniqueEnd, frames.end());
+	return frames;
+}
+
+bool ofApp::jumpToCameraWorkMark(int direction) {
+	if(!preloadReady || renderFrames.empty()) {
+		statusMessage = "No loaded frames";
+		return false;
+	}
+
+	const std::vector<double> frames = collectCameraWorkMarkFrames();
+	if(frames.empty()) {
+		statusMessage = "No camera work points";
+		return false;
+	}
+
+	constexpr double stepEpsilon = 0.0001;
+	double targetFrame = frames.front();
+	std::string label = "first";
+	if(direction > 0) {
+		auto it = std::upper_bound(frames.begin(), frames.end(), playbackFramePosition + stepEpsilon);
+		if(it == frames.end()) {
+			it = frames.begin();
+		}
+		targetFrame = *it;
+		label = "next";
+	} else if(direction < 0) {
+		auto it = std::lower_bound(frames.begin(), frames.end(), playbackFramePosition - stepEpsilon);
+		if(it == frames.begin()) {
+			targetFrame = frames.back();
+		} else {
+			targetFrame = *(it - 1);
+		}
+		label = "previous";
+	}
+
+	playing = false;
+	cameraWorkReviewPlaying = false;
+	playbackCarryFrames = 0.0;
+	autoRotateParam = false;
+	autoRotationDegrees = 0.0f;
+	if(direction == 0) {
+		playbackStopFrame = frames.back();
+	} else {
+		playbackStopFrame.reset();
+	}
+	if(!cameraTimeline.empty()) {
+		cameraTimeline.setMode(ofxCameraTimeline::Mode::Timeline);
+		cameraTimeline.setEnabled(true);
+	}
+	if(!rotationCues.empty()) {
+		rotationCueEnabled = true;
+	}
+	playbackFramePosition = targetFrame;
+	applyPlaybackPosition(true);
+	applyRotationCues(playbackFramePosition);
+	cameraTimeline.apply(playbackFramePosition);
+	const bool ptsmRestored = applyPtsmCameraWorkPoint(targetFrame, direction == 0);
+	cameraTimeline.setEnabled(false);
+	if(cameraMode == 0) {
+		cam.enableMouseInput();
+	}
+	constrainCameraDistance();
+	syncDisplaySettings();
+	statusMessage = "Jumped to " + label + " camera work point frame " + ofToString(playbackFramePosition, 3);
+	if(currentFrameIndex < renderFrames.size()) {
+		statusMessage += " / snapshot " + ofToString(renderFrames[currentFrameIndex].frameNumber);
+	}
+	if(direction == 0 && playbackStopFrame.has_value()) {
+		statusMessage += " / stop " + ofToString(*playbackStopFrame, 3);
+	}
+	statusMessage += ptsmRestored ? " / ptsm restored" : " / no ptsm point";
+	return true;
+}
+
+void ofApp::addCameraWorkPoint() {
+	cameraWorkReviewPlaying = false;
+	playbackCarryFrames = 0.0;
+	playbackStopFrame.reset();
+	const float capturedRotation = currentSceneRotationDegrees();
+	autoRotateParam = false;
+	autoRotationDegrees = 0.0f;
+	rotationDegrees = capturedRotation;
+
+	cameraTimeline.setMode(ofxCameraTimeline::Mode::Timeline);
+	const bool addedCamera = cameraTimeline.addKeyframe(playbackFramePosition);
+	upsertRotationCue(playbackFramePosition, capturedRotation, rotationCueInfluenceFrames);
+	rotationCueEnabled = true;
+	const std::optional<PtsmCameraWorkPoint> ptsmPoint = captureCurrentPtsmCameraWorkPoint(playbackFramePosition);
+	if(ptsmPoint.has_value()) {
+		upsertPtsmCameraWorkPoint(*ptsmPoint);
+	}
+
+	if(addedCamera) {
+		statusMessage = "Saved camera work point frame " + ofToString(playbackFramePosition, 3) +
+			" angle " + ofToString(capturedRotation, 1) + " deg";
+		statusMessage += ptsmPoint.has_value() ? " / ptsm linked" : " / no ptsm probe";
+	} else {
+		statusMessage = "Failed to save camera work point";
+	}
+}
+
+bool ofApp::removeNearestCameraWorkPoint(double threshold) {
+	cameraWorkReviewPlaying = false;
+	playbackCarryFrames = 0.0;
+	playbackStopFrame.reset();
+	const bool cameraRemoved = cameraTimeline.removeNearestKeyframe(playbackFramePosition, threshold);
+	const bool rotationRemoved = removeNearestRotationCue(threshold);
+	const bool ptsmRemoved = removeNearestPtsmCameraWorkPoint(threshold);
+	if(cameraRemoved && rotationRemoved && ptsmRemoved) {
+		statusMessage = "Removed camera work point";
+	} else if(cameraRemoved) {
+		statusMessage = ptsmRemoved ? "Removed camera point and PTSM point" : "Removed camera point";
+	} else if(rotationRemoved) {
+		statusMessage = ptsmRemoved ? "Removed rotation point and PTSM point" : "Removed rotation point";
+	} else if(ptsmRemoved) {
+		statusMessage = "Removed PTSM point";
+	} else {
+		statusMessage = "No nearby camera work point";
+	}
+	return cameraRemoved || rotationRemoved || ptsmRemoved;
+}
+
+std::optional<ofApp::PtsmCameraWorkPoint> ofApp::captureCurrentPtsmCameraWorkPoint(double frame) const {
+	PtsmCameraWorkPoint point;
+	point.frame = frame;
+	if(const ptsm::ProbeState* probe = ptsmEngine.getProbeState(0)) {
+		if(probe->alive && isFiniteVec3(probe->position) && isFiniteVec3(probe->velocity)) {
+			point.position = probe->position;
+			point.velocity = probe->velocity;
+			return point;
+		}
+	}
+	if(ptsmCurrentSpawnPosition.has_value() && ptsmCurrentSpawnVelocity.has_value() &&
+	   isFiniteVec3(*ptsmCurrentSpawnPosition) && isFiniteVec3(*ptsmCurrentSpawnVelocity)) {
+		point.position = *ptsmCurrentSpawnPosition;
+		point.velocity = *ptsmCurrentSpawnVelocity;
+		return point;
+	}
+	if(ptsmLockedSpawnPosition.has_value() && ptsmLockedSpawnVelocity.has_value() &&
+	   isFiniteVec3(*ptsmLockedSpawnPosition) && isFiniteVec3(*ptsmLockedSpawnVelocity)) {
+		point.position = *ptsmLockedSpawnPosition;
+		point.velocity = *ptsmLockedSpawnVelocity;
+		return point;
+	}
+	return std::nullopt;
+}
+
+void ofApp::upsertPtsmCameraWorkPoint(const PtsmCameraWorkPoint& point) {
+	if(!std::isfinite(point.frame) || !isFiniteVec3(point.position) || !isFiniteVec3(point.velocity)) {
+		return;
+	}
+	auto insertIt = std::lower_bound(
+		ptsmCameraWorkPoints.begin(),
+		ptsmCameraWorkPoints.end(),
+		point.frame,
+		[](const PtsmCameraWorkPoint& existing, double frame) {
+			return existing.frame < frame;
+		}
+	);
+	if(insertIt != ptsmCameraWorkPoints.end() && std::abs(insertIt->frame - point.frame) <= 0.0001) {
+		*insertIt = point;
+	} else {
+		ptsmCameraWorkPoints.insert(insertIt, point);
+	}
+}
+
+bool ofApp::removeNearestPtsmCameraWorkPoint(double threshold) {
+	double bestDistance = std::max(0.0, threshold);
+	int bestIndex = -1;
+	for(std::size_t i = 0; i < ptsmCameraWorkPoints.size(); ++i) {
+		const double distance = std::abs(ptsmCameraWorkPoints[i].frame - playbackFramePosition);
+		if(distance <= bestDistance) {
+			bestDistance = distance;
+			bestIndex = static_cast<int>(i);
+		}
+	}
+	if(bestIndex < 0) {
+		return false;
+	}
+	ptsmCameraWorkPoints.erase(ptsmCameraWorkPoints.begin() + bestIndex);
+	return true;
+}
+
+const ofApp::PtsmCameraWorkPoint* ofApp::findNearestPtsmCameraWorkPoint(double frame, double threshold) const {
+	double bestDistance = std::max(0.0, threshold);
+	const PtsmCameraWorkPoint* bestPoint = nullptr;
+	for(const auto& point : ptsmCameraWorkPoints) {
+		const double distance = std::abs(point.frame - frame);
+		if(distance <= bestDistance) {
+			bestDistance = distance;
+			bestPoint = &point;
+		}
+	}
+	return bestPoint;
+}
+
+bool ofApp::applyPtsmCameraWorkPoint(double frame, bool allowSavedLockFallback, double threshold) {
+	if(const PtsmCameraWorkPoint* point = findNearestPtsmCameraWorkPoint(frame, threshold)) {
+		return setPtsmProbeState(point->position, point->velocity);
+	}
+	if(!ptsmLockedSpawnPosition.has_value() || !ptsmLockedSpawnVelocity.has_value()) {
+		return false;
+	}
+	const bool frameMatchesLockedSpawn =
+		ptsmLockedSpawnFrame.has_value() && std::abs(*ptsmLockedSpawnFrame - frame) <= threshold;
+	if(!frameMatchesLockedSpawn && !allowSavedLockFallback) {
+		return false;
+	}
+	return setPtsmProbeState(*ptsmLockedSpawnPosition, *ptsmLockedSpawnVelocity);
+}
+
+void ofApp::addRotationCue() {
+	const float capturedRotation = currentSceneRotationDegrees();
+	autoRotationDegrees = 0.0f;
+	rotationDegrees = capturedRotation;
+	upsertRotationCue(playbackFramePosition, capturedRotation, rotationCueInfluenceFrames);
+	statusMessage = "Saved rotation cue " + ofToString(capturedRotation, 1) + " deg";
+}
+
+void ofApp::upsertRotationCue(double frame, float degrees, float influenceFrames) {
+	RotationCue cue;
+	cue.frame = frame;
+	cue.degrees = normalizeDegrees(degrees);
+	cue.influenceFrames = influenceFrames;
 	auto insertIt = std::lower_bound(
 		rotationCues.begin(),
 		rotationCues.end(),
@@ -3823,14 +4233,12 @@ void ofApp::addRotationCue() {
 	} else {
 		rotationCues.insert(insertIt, cue);
 	}
-
-	statusMessage = "Saved rotation cue " + ofToString(cue.degrees, 1) + " deg";
 }
 
-void ofApp::removeNearestRotationCue(double threshold) {
+bool ofApp::removeNearestRotationCue(double threshold) {
 	if(rotationCues.empty()) {
 		statusMessage = "No rotation cues";
-		return;
+		return false;
 	}
 
 	double bestDistance = std::max(0.0, threshold);
@@ -3845,12 +4253,13 @@ void ofApp::removeNearestRotationCue(double threshold) {
 
 	if(bestIndex < 0) {
 		statusMessage = "No nearby rotation cue";
-		return;
+		return false;
 	}
 
 	const float removedDegrees = rotationCues[static_cast<std::size_t>(bestIndex)].degrees;
 	rotationCues.erase(rotationCues.begin() + bestIndex);
 	statusMessage = "Removed rotation cue " + ofToString(removedDegrees, 1) + " deg";
+	return true;
 }
 
 void ofApp::sortRotationCues() {
@@ -3867,6 +4276,36 @@ void ofApp::applyRotationCues(double playbackPosition) {
 	lastRotationCueWeight = 0.0f;
 	if(!rotationCueEnabled || rotationCues.empty()) {
 		rotationDegrees = normalizeDegrees(rotationDegrees);
+		return;
+	}
+
+	if(cameraTimeline.getMode() == ofxCameraTimeline::Mode::Timeline) {
+		if(rotationCues.size() == 1 || playbackPosition <= rotationCues.front().frame) {
+			rotationDegrees = normalizeDegrees(rotationCues.front().degrees);
+			lastRotationCueWeight = 1.0f;
+			return;
+		}
+		if(playbackPosition >= rotationCues.back().frame) {
+			rotationDegrees = normalizeDegrees(rotationCues.back().degrees);
+			lastRotationCueWeight = 1.0f;
+			return;
+		}
+
+		auto upper = std::upper_bound(
+			rotationCues.begin(),
+			rotationCues.end(),
+			playbackPosition,
+			[](double frame, const RotationCue& cue) {
+				return frame < cue.frame;
+			}
+		);
+		const RotationCue& next = *upper;
+		const RotationCue& previous = *(upper - 1);
+		const double span = std::max(next.frame - previous.frame, std::numeric_limits<double>::epsilon());
+		float t = static_cast<float>((playbackPosition - previous.frame) / span);
+		t = ofClamp(t, 0.0f, 1.0f);
+		rotationDegrees = mixDegrees(previous.degrees, next.degrees, t);
+		lastRotationCueWeight = t;
 		return;
 	}
 
@@ -3898,7 +4337,11 @@ void ofApp::applyRotationCues(double playbackPosition) {
 
 void ofApp::adjustRotationDegrees(float deltaDegrees) {
 	rotationDegrees = normalizeDegrees(rotationDegrees + deltaDegrees);
-	statusMessage = "Rotation angle " + ofToString(rotationDegrees, 1) + " deg";
+	statusMessage = "Rotation angle " + ofToString(currentSceneRotationDegrees(), 1) + " deg";
+}
+
+float ofApp::currentSceneRotationDegrees() const {
+	return normalizeDegrees(rotationDegrees + autoRotationDegrees);
 }
 
 bool ofApp::loadRotationCues(const std::string& path) {
@@ -3965,6 +4408,78 @@ bool ofApp::saveRotationCues(const std::string& path) const {
 	return true;
 }
 
+bool ofApp::loadPtsmCameraWorkPoints(const std::string& path) {
+	const std::string resolvedPath = ofToDataPath(path, true);
+	if(!ofFile::doesFileExist(resolvedPath)) {
+		return false;
+	}
+
+	ofJson json;
+	try {
+		json = ofLoadJson(resolvedPath);
+	} catch(const std::exception& error) {
+		statusMessage = "Failed to load PTSM camera work points: " + std::string(error.what());
+		return false;
+	}
+
+	if(!json.contains("points") || !json["points"].is_array()) {
+		statusMessage = "PTSM camera work point file has no points";
+		return false;
+	}
+
+	std::vector<PtsmCameraWorkPoint> loaded;
+	for(const auto& entry : json["points"]) {
+		if(!entry.is_object() || !entry.contains("frame") ||
+		   !entry.contains("position") || !entry.contains("velocity")) {
+			continue;
+		}
+
+		PtsmCameraWorkPoint point;
+		point.frame = entry.value("frame", 0.0);
+		if(!std::isfinite(point.frame) ||
+		   !jsonToVec3(entry["position"], point.position) ||
+		   !jsonToVec3(entry["velocity"], point.velocity)) {
+			continue;
+		}
+		loaded.push_back(point);
+	}
+
+	std::sort(
+		loaded.begin(),
+		loaded.end(),
+		[](const PtsmCameraWorkPoint& a, const PtsmCameraWorkPoint& b) {
+			return a.frame < b.frame;
+		}
+	);
+	ptsmCameraWorkPoints = std::move(loaded);
+	statusMessage = "Loaded " + ofToString(ptsmCameraWorkPoints.size()) + " PTSM camera work points";
+	return true;
+}
+
+bool ofApp::savePtsmCameraWorkPoints(const std::string& path) const {
+	const std::string resolvedPath = ofToDataPath(path, true);
+	ofJson json;
+	json["version"] = 1;
+	json["points"] = ofJson::array();
+	for(const auto& point : ptsmCameraWorkPoints) {
+		if(!std::isfinite(point.frame) || !isFiniteVec3(point.position) || !isFiniteVec3(point.velocity)) {
+			continue;
+		}
+		ofJson entry;
+		entry["frame"] = point.frame;
+		entry["position"] = vec3ToJson(point.position);
+		entry["velocity"] = vec3ToJson(point.velocity);
+		json["points"].push_back(entry);
+	}
+
+	try {
+		ofSavePrettyJson(resolvedPath, json);
+	} catch(const std::exception&) {
+		return false;
+	}
+	return true;
+}
+
 float ofApp::normalizeDegrees(float degrees) {
 	float normalized = std::fmod(degrees, 360.0f);
 	if(normalized < 0.0f) {
@@ -3998,9 +4513,11 @@ void ofApp::drawPointCloud() {
 		return;
 	}
 
+	const bool stabilizeRotate = autoRotateParam && cameraMode == 0;
+
 	glEnable(GL_BLEND);
 	glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-	if(depthParticlesParam) {
+	if(depthParticlesParam && !stabilizeRotate) {
 		glEnable(GL_DEPTH_TEST);
 	} else {
 		glDisable(GL_DEPTH_TEST);
@@ -4094,6 +4611,8 @@ void ofApp::drawHud() const {
 			<< '\n';
 		text << (playing ? "playing" : "paused")
 			<< "  blend=" << currentFrameBlend
+			<< "  fps=" << (cameraWorkReviewPlaying ? cameraReviewFpsParam.get() : playbackFpsParam.get())
+			<< (cameraWorkReviewPlaying ? " review" : "")
 			<< "  stride=" << displayStride
 			<< "  mode=" << (performanceModeParam ? "fast" : "quality")
 			<< "  fullRes=" << (fullResolutionParam ? "on" : "off")
@@ -4110,7 +4629,10 @@ void ofApp::drawHud() const {
 		text << '\n'
 			<< "rotationCues=" << (rotationCueEnabled ? "on" : "off")
 			<< "  keys=" << rotationCues.size()
-			<< "  angle=" << normalizeDegrees(rotationDegrees)
+			<< "  angle=" << currentSceneRotationDegrees()
+			<< "  base=" << normalizeDegrees(rotationDegrees)
+			<< "  auto=" << normalizeDegrees(autoRotationDegrees)
+			<< "  autoSpeed=" << autoRotateSpeedParam.get()
 			<< "  cueWidth=" << rotationCueInfluenceFrames
 			<< "  cueWeight=" << lastRotationCueWeight;
 		text << '\n'
@@ -4121,11 +4643,11 @@ void ofApp::drawHud() const {
 			<< "  flow=" << ptsmFlowSamplesCurrent.size()
 			<< "  sigma=" << ptsmSettings.field.sigma
 			<< "  gain=" << ptsmSettings.field.fieldGain
+			<< "  densityTurn=" << ptsmDensityTurnParam.get()
 			<< "  flowFollow=" << ptsmFlowCouplingParam.get()
-			<< "  steering=" << (ptsmConstantSpeedParam ? "const" : "legacy")
+			<< "  flowTurn=" << ptsmFlowTurnParam.get()
+			<< "  vortexTurn=" << ptsmVortexTurnParam.get()
 			<< "  target=" << ptsmTargetSpeedParam.get()
-			<< "  time=" << ptsmTimeScaleParam.get()
-			<< "  sync=" << ptsmPlaybackCouplingParam.get()
 			<< "  trailColor=" << trailColorPresetLabel(ptsmTrailPresetParam.get());
 		if(ptsmLastGalaxyField.valid) {
 			text << '\n'
@@ -4134,16 +4656,9 @@ void ofApp::drawHud() const {
 				<< "  div=" << ptsmLastGalaxyField.divergence
 				<< "  vort=" << ptsmLastGalaxyField.vorticityMag
 				<< "  shear=" << ptsmLastGalaxyField.shear
-				<< "  disp=" << ptsmLastGalaxyField.dispersion;
-			if(ptsmDebugSteeringParam) {
-				text << '\n'
-					<< "steering"
-					<< "  speed=" << ptsmLastGalaxyField.currentSpeed
-					<< "  err=" << ptsmLastGalaxyField.speedError
-					<< "  turn=" << ptsmLastGalaxyField.turnRate
-					<< "  curv=" << ptsmLastGalaxyField.steeringCurvature
-					<< "  align=" << ptsmLastGalaxyField.flowAlignment;
-			}
+				<< "  disp=" << ptsmLastGalaxyField.dispersion
+				<< "  align=" << ptsmLastGalaxyField.flowAlignment
+				<< "  speed=" << ptsmLastGalaxyField.currentSpeed;
 		}
 	} else {
 		text << statusMessage;

@@ -66,9 +66,13 @@ private:
 		float dispersion = 0.0f;
 		float divergence = 0.0f;
 		float compression = 0.0f;
+		float expansion = 0.0f;
 		float shear = 0.0f;
 		float slip = 0.0f;
 		float vorticityMag = 0.0f;
+		float kernelWeightSum = 0.0f;
+		int neighborCount = 0;
+		float confidence = 0.0f;
 		float rawForceMag = 0.0f;
 		float lateralForceMag = 0.0f;
 		float parallelForceMag = 0.0f;
@@ -78,6 +82,7 @@ private:
 		float speedError = 0.0f;
 		float targetSpeed = 0.0f;
 		float currentSpeed = 0.0f;
+		float rawForceChangeRate = 0.0f;
 		bool valid = false;
 	};
 
@@ -92,7 +97,20 @@ private:
 		float influenceFrames = 120.0f;
 	};
 
+	struct PtsmCameraWorkPoint {
+		double frame = 0.0;
+		glm::vec3 position = glm::vec3(0.0f);
+		glm::vec3 velocity = glm::vec3(0.0f);
+	};
+
+	enum class PlaybackStopReason {
+		None,
+		RenderEnd,
+		CameraWorkEnd
+	};
+
 	void setupGui();
+	void layoutGuiPanels();
 	void setupPointShader();
 	void setupPtsm();
 	std::string resolveDataDirectoryPath() const;
@@ -134,7 +152,8 @@ private:
 	void beginNextFramePrefetch(std::size_t frameIndex);
 	void finishNextFramePrefetch();
 	void waitForPendingPrefetch();
-	void updatePlaybackPosition(double deltaSeconds);
+	PlaybackStopReason updatePlaybackPosition(double deltaSeconds);
+	void completeCameraExport();
 	void applyPlaybackPosition(bool reloadRenderFrame);
 	void frameStateForPosition(double playbackPosition, std::size_t& frameIndex, float& frameBlend) const;
 	std::size_t getInterpolatedParticleCount() const;
@@ -162,7 +181,6 @@ private:
 		const glm::vec3& probeVelocity
 	) const;
 	void updatePtsmSteeringPhysics(float dt);
-	void applyPtsmFlowForces(float dt);
 	glm::mat3 outerProduct(const glm::vec3& a, const glm::vec3& b) const;
 	float frobeniusNorm(const glm::mat3& matrix) const;
 	glm::vec3 limitVectorLength(const glm::vec3& value, float maxLength) const;
@@ -171,13 +189,13 @@ private:
 	void applyPtsmProbeBounds(ptsm::ProbeState& probe) const;
 	void appendPtsmProbeTrail(ptsm::ProbeState& probe);
 	float computePtsmProbeCurvature(const ptsm::ProbeState& probe) const;
-	glm::vec3 ptsmTangentVelocityForSpawn(const glm::vec3& position, const glm::vec3& fallbackVelocity) const;
 	glm::vec3 randomUnitVector() const;
 	void samplePtsmAuditionSpawn(glm::vec3& position, glm::vec3& velocity) const;
 	void choosePtsmSpawn(glm::vec3& position, glm::vec3& velocity);
 	void spawnPtsmProbe();
+	bool setPtsmProbeState(const glm::vec3& position, const glm::vec3& velocity);
+	bool spawnPtsmProbeFromSavedLock();
 	void lockPtsmSpawn();
-	void clearPtsmSpawnLock();
 	bool loadPtsmSpawnLock(const std::string& path);
 	bool savePtsmSpawnLock(const std::string& path) const;
 	void clearPtsmProbes();
@@ -190,11 +208,24 @@ private:
 	void sendPtsmMetrics();
 	std::string cameraModeLabel() const;
 	std::string colorPaletteLabel() const;
+	std::vector<double> collectCameraWorkMarkFrames() const;
+	bool jumpToCameraWorkMark(int direction);
+	void addCameraWorkPoint();
+	bool removeNearestCameraWorkPoint(double threshold = 8.0);
+	std::optional<PtsmCameraWorkPoint> captureCurrentPtsmCameraWorkPoint(double frame) const;
+	void upsertPtsmCameraWorkPoint(const PtsmCameraWorkPoint& point);
+	bool removeNearestPtsmCameraWorkPoint(double threshold = 8.0);
+	const PtsmCameraWorkPoint* findNearestPtsmCameraWorkPoint(double frame, double threshold) const;
+	bool applyPtsmCameraWorkPoint(double frame, bool allowSavedLockFallback, double threshold = 0.01);
+	bool loadPtsmCameraWorkPoints(const std::string& path);
+	bool savePtsmCameraWorkPoints(const std::string& path) const;
 	void addRotationCue();
-	void removeNearestRotationCue(double threshold = 8.0);
+	void upsertRotationCue(double frame, float degrees, float influenceFrames);
+	bool removeNearestRotationCue(double threshold = 8.0);
 	void sortRotationCues();
 	void applyRotationCues(double playbackPosition);
 	void adjustRotationDegrees(float deltaDegrees);
+	float currentSceneRotationDegrees() const;
 	bool loadRotationCues(const std::string& path);
 	bool saveRotationCues(const std::string& path) const;
 	static float normalizeDegrees(float degrees);
@@ -229,13 +260,17 @@ private:
 	std::unordered_map<std::size_t, std::vector<RenderParticle>> ramFrameCache;
 	std::deque<std::size_t> ramFrameCacheOrder;
 	std::vector<RotationCue> rotationCues;
+	std::vector<PtsmCameraWorkPoint> ptsmCameraWorkPoints;
 
 	ofxPanel gui;
+	ofxPanel ptsmPanel;
 	ofParameterGroup guiParams;
+	ofParameterGroup ptsmGuiParams;
 	ofParameter<float> pointSizeParam;
 	ofParameter<float> sceneScaleParam;
 	ofParameter<float> coreScaleParam;
 	ofParameter<float> playbackFpsParam;
+	ofParameter<float> cameraReviewFpsParam;
 	ofParameter<bool> temporalSmoothParam;
 	ofParameter<float> brightnessParam;
 	ofParameter<float> gradientParam;
@@ -254,6 +289,7 @@ private:
 	ofParameter<bool> showStarsParam;
 	ofParameter<bool> showBoundsParam;
 	ofParameter<bool> autoRotateParam;
+	ofParameter<float> autoRotateSpeedParam;
 	ofParameter<bool> showGuiParam;
 	ofParameter<float> ptsmProbeRadiusParam;
 	ofParameter<float> ptsmTrailAlphaParam;
@@ -264,15 +300,14 @@ private:
 	ofParameter<int> ptsmTrailSmoothingParam;
 	ofParameter<int> ptsmTrailLengthParam;
 	ofParameter<float> ptsmDensityMixParam;
+	ofParameter<float> ptsmDensityTurnParam;
 	ofParameter<float> ptsmFlowCouplingParam;
 	ofParameter<float> ptsmFlowRadiusParam;
 	ofParameter<float> ptsmFlowVelocityScaleParam;
 	ofParameter<float> ptsmFlowVerticalMixParam;
 	ofParameter<float> ptsmTidalGainParam;
-	ofParameter<float> ptsmVorticityGainParam;
 	ofParameter<float> ptsmCompressionGainParam;
 	ofParameter<float> ptsmDispersionGainParam;
-	ofParameter<bool> ptsmConstantSpeedParam;
 	ofParameter<float> ptsmTargetSpeedParam;
 	ofParameter<float> ptsmSpeedHoldParam;
 	ofParameter<float> ptsmTimeScaleParam;
@@ -281,11 +316,8 @@ private:
 	ofParameter<float> ptsmMaxTurnRateParam;
 	ofParameter<float> ptsmFlowTurnParam;
 	ofParameter<float> ptsmVortexTurnParam;
-	ofParameter<float> ptsmDensityTurnParam;
 	ofParameter<float> ptsmMinSpeedParam;
 	ofParameter<float> ptsmSteeringMaxSpeedParam;
-	ofParameter<bool> ptsmSpawnTangentParam;
-	ofParameter<bool> ptsmDebugSteeringParam;
 	ofParameter<bool> ptsmLookAtCenterParam;
 
 	ptsm::Settings ptsmSettings;
@@ -304,6 +336,8 @@ private:
 	std::vector<PtsmFlowSample> ptsmFlowSamplesCurrent;
 	std::vector<PtsmFlowSample> ptsmFlowSamplesNext;
 	GalaxyFieldLocal ptsmLastGalaxyField;
+	glm::vec3 ptsmPreviousRawForce = glm::vec3(0.0f);
+	bool ptsmPreviousRawForceValid = false;
 
 	glm::vec3 worldMin = glm::vec3(-1.35f, -1.05f, -1.05f);
 	glm::vec3 worldMax = glm::vec3(1.35f, 1.05f, 1.05f);
@@ -321,11 +355,15 @@ private:
 	int textureWidth = 1;
 	int textureHeight = 1;
 	bool playing = false;
+	bool cameraWorkReviewPlaying = false;
 	bool preloadReady = false;
 	double lastUpdateTime = 0.0;
 	double playbackFramePosition = 0.0;
+	double playbackCarryFrames = 0.0;
+	std::optional<double> playbackStopFrame;
 	float currentFrameBlend = 0.0f;
 	float rotationDegrees = 0.0f;
+	float autoRotationDegrees = 0.0f;
 	float rotationCueInfluenceFrames = 120.0f;
 	float lastRotationCueWeight = 0.0f;
 	bool rotationCueEnabled = true;
@@ -339,6 +377,7 @@ private:
 	std::optional<glm::vec3> ptsmCurrentSpawnVelocity;
 	std::optional<glm::vec3> ptsmLockedSpawnPosition;
 	std::optional<glm::vec3> ptsmLockedSpawnVelocity;
+	std::optional<double> ptsmLockedSpawnFrame;
 	int cameraMode = 0;
 	glm::vec3 cameraForward = glm::vec3(0.0f, 0.0f, -1.0f);
 	glm::vec3 cameraRight = glm::vec3(1.0f, 0.0f, 0.0f);
@@ -368,6 +407,7 @@ private:
 	const std::string cameraTimelinePath = "camera_path.json";
 	const std::string rotationCuesPath = "rotation_cues.json";
 	const std::string ptsmSpawnLockPath = "ptsm_locked_spawn.json";
+	const std::string ptsmCameraWorkPointsPath = "ptsm_camera_work_points.json";
 
 	std::size_t cacheParticleLimit = 2000000;
 	std::size_t maxRamCachedFrames = 24;
